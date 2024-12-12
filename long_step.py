@@ -12,7 +12,7 @@ Two steps to the EKF:
         - From what the robot observes, how do we change our state estimation?
         - We reconcile current uncertainty with uncertainty of measurements
 """
-
+import os
 import pygame.gfxdraw
 from python_ugv_sim.utils import vehicles, environment
 import numpy as np
@@ -39,7 +39,7 @@ n_landmarks = len(landmarks)
 
 # -----------Noise parameters
 R = np.diag([0.002, 0.002, 0.00003])
-Q = np.diag([0.003, 0.000003])
+Q = np.diag([0.003, 0.000003, 0.01])
 
 # --------> EKF estimation variables
 mu = np.zeros((n_state + 2 * n_landmarks, 1))
@@ -60,8 +60,15 @@ def sim_measurements(x, landmarks):
         dist = np.linalg.norm(np.array([lx-rx, ly-ry])) # distance between robot and landmark
         phi = np.arctan2(ly - ry, lx - rx) - rtheta # Angle between robot heading and landmark, relative to robot frame
         phi = np.arctan2(np.sin(phi), np.cos(phi)) # Keep phi bounded, -pi <= phi <= +pi
+        # signature = lidx + np.random.normal(0, 0.01) # i will move this step in the if statement to make the signature different for each landmark
         if dist < robot_fov: # only append if observation is within robot field of view
-            zs.append((dist, phi, lidx))
+
+            # Generate different signature based on landmark characteristics
+            # Here's an example using distance to create varying signatures:
+            signature = max(0, min(1, 1.0 - dist/robot_fov))  # Closer landmarks have higher signatures
+            # Or you could use the landmark index:
+            # signature = (lidx + 1) / len(landmarks)  # Each landmark gets a different signature
+            zs.append((dist, phi, signature, lidx))
     return zs
 
 # EKF steps
@@ -85,32 +92,39 @@ def prediction_update(mu, sigma, u, dt):
 
 def measurement_update(mu, sigma, zs):
     rx, ry, theta = mu[0, 0], mu[1, 0], mu[2, 0]
-    delta_zs = [np.zeros((2, 1)) for lidx in range(n_landmarks)]
-    Ks = [np.zeros((mu.shape[0], 2)) for lidx in range(n_landmarks)]
-    Hs = [np.zeros((2, mu.shape[0])) for lidx in range(n_landmarks)]
+    delta_zs = [np.zeros((3, 1)) for lidx in range(n_landmarks)]
+    Ks = [np.zeros((mu.shape[0], 3)) for lidx in range(n_landmarks)]
+    Hs = [np.zeros((3, mu.shape[0])) for lidx in range(n_landmarks)]
 
     for z in zs:
-        (dist, phi, lidx) = z
+        (dist, phi, signature, lidx) = z
         mu_landmark = mu[n_state + lidx * 2 : n_state + lidx * 2 + 2]
+
         if np.isnan(mu_landmark[0]):
             mu_landmark[0] = rx + dist * np.cos(phi + theta)
             mu_landmark[1] = ry + dist * np.sin(phi + theta)
             mu[n_state + lidx * 2 : n_state + lidx * 2 + 2]
+
+
         delta = mu_landmark - np.array([[rx], [ry]])
         q = np.linalg.norm(delta)**2
 
         dist_est = np.sqrt(q) # Estimated distance
         phi_est = np.arctan2(delta[1, 0], delta[0, 0]) - theta # Estimated relative bearing
         phi_est = np.arctan2(np.sin(phi_est), np.cos(phi_est))
-        z_est_arr = np.array([[dist_est], [phi_est]])
-        z_act_arr = np.array([[dist], [phi]])
+        signature_est = lidx  # Expected signature based on landmark index
+
+        z_est_arr = np.array([[dist_est], [phi_est], [signature_est]])
+        z_act_arr = np.array([[dist], [phi], [signature]])
+
         delta_zs[lidx] = z_act_arr - z_est_arr
 
         Fxj = np.block([[Fx], [np.zeros((2, Fx.shape[1]))]])
         Fxj[n_state : n_state + 2, n_state + 2 * lidx : n_state + 2 * lidx + 2] = np.eye(2)
 
         H = np.array([[-delta[0, 0] / np.sqrt(q), -delta[1, 0] / np.sqrt(q), 0, delta[0, 0] / np.sqrt(q), delta[1, 0] / np.sqrt(q)], \
-                      [delta[1, 0] / q, -delta[0, 0] / q, -1, -delta[1, 0] / q, +delta[0, 0] / q]])
+                      [delta[1, 0] / q, -delta[0, 0] / q, -1, -delta[1, 0] / q, +delta[0, 0] / q], \
+                        [0, 0, 0, 0, 0]])
         H = H.dot(Fxj)
         Hs[lidx] = H
         Ks[lidx] = sigma.dot(np.transpose(H)).dot(np.linalg.inv(H.dot(sigma).dot(np.transpose(H)) + Q))
@@ -176,10 +190,23 @@ def show_measurements(x, zs, env):
     rx, ry, theta = x[0], x[1], x[2]
     rx_pix, ry_pix = env.position2pixel((rx, ry)) # convert robot position units from meters to pixels
     for z in zs: # For each measurement
-        dist, phi, lidx = z # Unpack measurement tuple
+        dist, phi, signature, lidx = z # Unpack measurement tuple
         lx, ly, = rx + dist * np.cos(phi + theta), ry + dist * np.sin(phi + theta) # Set the observed landmark location (lx, ly)
         lx_pix, ly_pix = env.position2pixel((lx, ly)) # Convert observed landmark locations units from meters to pixels
-        pygame.gfxdraw.line(env.get_pygame_surface(), rx_pix, ry_pix, lx_pix, ly_pix, (155, 155, 155)) # Draw a line between robot and observed landmark
+        
+        # Color coding based on signature value
+        # Ensure color values are integers between 0 and 255
+        red = max(0, min(255, int(105 * signature)))
+        blue = max(0, min(255, int(55 * (1-signature))))
+        gray = max(0, min(255, int(127.5 * (1 + signature))))  # Gray value for additional blending
+        
+        color = (red, gray, blue)
+        
+        pygame.gfxdraw.line(env.get_pygame_surface(),rx_pix,ry_pix,lx_pix,ly_pix,color) # Draw a line between robot and observed landmark
+        
+        # Draw a small circle at landmark location with size proportional to signature
+        circle_radius = max(1, int(env.dist2pixellen(0.1 + 0.1 * signature))) # Ensure radius is at least 1 pixel
+        pygame.gfxdraw.filled_circle(env.get_pygame_surface(),lx_pix,ly_pix,circle_radius,color)
 
 
 # < -------------PLOTTING STUFF ---------------->
@@ -201,6 +228,9 @@ if __name__=='__main__':
     # Initialize and display environment
     env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.png")
 
+    # List to store the path of the robot in pixel coordinates
+    robot_path = []    
+
     running = True
     u = np.array([0.,0.]) # Controls, forward/backward velocity, angular velocity
     while running:
@@ -209,11 +239,17 @@ if __name__=='__main__':
                 running = False
             u = robot.update_u(u,event) if event.type==pygame.KEYUP or event.type==pygame.KEYDOWN else u # Update controls based on key states
         robot.move_step(u,dt) # Integrate EOMs forward, i.e., move robot
+
+        # Get the current robot position in pixel coordinates
+        rx, ry, _ = robot.x
+
         # Get measurements
         zs = sim_measurements(robot.get_pose(), landmarks)
         #EKF SLAM logic
         mu, sigma = prediction_update(mu, sigma, u, dt)
         mu, sigma = measurement_update(mu, sigma, zs)
+        rx_pix, ry_pix = env.position2pixel((rx, ry))
+        robot_path.append((rx_pix, ry_pix))  # Append current position to path
         # Show ground truth
         env.show_map() # Re-blit map
         env.show_robot(robot) # Re-blit robot
@@ -222,4 +258,15 @@ if __name__=='__main__':
         # Show EKF estimates
         show_robot_estimate(mu, sigma, env)
         show_landmark_estimate(mu, sigma, env)
+        if len (robot_path) > 1:
+            pygame.draw.lines(env.get_pygame_surface(), (0, 0, 0), False, robot_path, 4)  # Green path, 2-pixel width
         pygame.display.update() # Update displaypython3 
+
+
+    # Save the map with the path after the simulation ends
+    save_dir = "./maps/"
+    os.makedirs(save_dir, exist_ok=True)  # Create the directory if it doesn't exist
+    map_surface = env.get_pygame_surface()  # Get the pygame surface
+    save_path = os.path.join(save_dir, "saved_map.png")
+    pygame.image.save(map_surface, save_path)  # Save the surface as an image
+    print(f"Map saved as '{save_path}'")
