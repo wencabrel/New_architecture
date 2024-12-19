@@ -21,7 +21,7 @@ import pygame
 # < -------------EKF STUFF ---------------->
 # --------> Robot parameters
 n_state = 3 # State dimention of the robot
-robot_fov = 3
+robot_fov = 2
 
 # ----------> Landmark parameters
 landmarks = [
@@ -195,7 +195,7 @@ def show_measurements(x, zs, env):
         lx_pix, ly_pix = env.position2pixel((lx, ly)) # Convert observed landmark locations units from meters to pixels
         
         # Color coding based on signature value
-        # Ensure color values are integers between 0 and 255
+        # i Ensured color values are integers between 0 and 255
         red = max(0, min(255, int(105 * signature)))
         blue = max(0, min(255, int(55 * (1-signature))))
         gray = max(0, min(255, int(127.5 * (1 + signature))))  # Gray value for additional blending
@@ -251,15 +251,15 @@ if __name__=='__main__':
         rx_pix, ry_pix = env.position2pixel((rx, ry))
         robot_path.append((rx_pix, ry_pix))  # Append current position to path
         # Show ground truth
-        env.show_map() # Re-blit map
-        env.show_robot(robot) # Re-blit robot
+        env.show_map() # Re-bluit map
+        env.show_robot(robot) # Re-bluit robot
         show_landmark_location(landmarks, env)
         show_measurements(robot.get_pose(), zs, env)
         # Show EKF estimates
         show_robot_estimate(mu, sigma, env)
         show_landmark_estimate(mu, sigma, env)
         if len (robot_path) > 1:
-            pygame.draw.lines(env.get_pygame_surface(), (0, 0, 0), False, robot_path, 4)  # Green path, 2-pixel width
+            pygame.draw.lines(env.get_pygame_surface(), (0, 0, 0), False, robot_path, 2)  # Green path, 2-pixel width
         pygame.display.update() # Update displaypython3 
 
 
