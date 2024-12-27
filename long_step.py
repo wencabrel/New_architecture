@@ -17,6 +17,162 @@ import pygame.gfxdraw
 from python_ugv_sim.utils import vehicles, environment
 import numpy as np
 import pygame
+from scipy.spatial.transform import Rotation
+
+# <---------------DATASET HANDLING STUFF ---------------->
+
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import re
+
+@dataclass
+class OdomReading:
+    x: float
+    y: float
+    theta: float
+    v: float  # forward velocity
+    omega: float  # angular velocity
+    timestamp: float
+
+@dataclass
+class LaserReading:
+    num_readings: int
+    ranges: List[float]
+    pose: Tuple[float, float, float]  # x, y, theta
+    timestamp: float
+
+class CLFDataLoader:
+    def __init__(self, data_path: str):
+        """
+        Initialize the CLF data loader
+        
+        Args:
+            data_path (str): Path to the CLF dataset file
+        """
+        self.data_path = data_path
+        self.odom_readings: List[OdomReading] = []
+        self.laser_readings: List[LaserReading] = []
+        self._load_data()
+    
+    def _parse_odom_line(self, parts: List[str]) -> OdomReading:
+        """Parse an ODOM line from the CLF file"""
+        return OdomReading(
+            x=float(parts[1]),
+            y=float(parts[2]),
+            theta=float(parts[3]),
+            v=float(parts[4]),
+            omega=float(parts[5]),
+            timestamp=float(parts[7])
+        )
+    
+    def _parse_laser_line(self, parts: List[str]) -> LaserReading:
+        """Parse a FLASER line from the CLF file"""
+        num_readings = int(parts[1])
+        ranges = [float(x) for x in parts[2:2+num_readings]]
+        # Pose data comes after the ranges
+        pose_idx = 2 + num_readings
+        pose = (
+            float(parts[pose_idx]),     # x
+            float(parts[pose_idx + 1]), # y
+            float(parts[pose_idx + 2])  # theta
+        )
+        timestamp = float(parts[pose_idx + 4])
+        
+        return LaserReading(
+            num_readings=num_readings,
+            ranges=ranges,
+            pose=pose,
+            timestamp=timestamp
+        )
+    
+    def _load_data(self):
+        """Load and parse the CLF dataset"""
+        try:
+            with open(self.data_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    
+                    reading_type = parts[0]
+                    
+                    if reading_type == 'ODOM':
+                        self.odom_readings.append(self._parse_odom_line(parts))
+                    elif reading_type == 'FLASER':
+                        self.laser_readings.append(self._parse_laser_line(parts))
+                    # We're ignoring SONAR readings for now as per your request
+                    
+            # Sort readings by timestamp
+            self.odom_readings.sort(key=lambda x: x.timestamp)
+            self.laser_readings.sort(key=lambda x: x.timestamp)
+            
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Dataset file not found at {self.data_path}")
+        except ValueError as e:
+            raise ValueError(f"Error parsing dataset: {e}")
+    
+    def get_pose_at_index(self, index: int) -> Tuple[float, float, float]:
+        """Get pose at specific index from odometry readings"""
+        if 0 <= index < len(self.odom_readings):
+            reading = self.odom_readings[index]
+            return (reading.x, reading.y, reading.theta)
+        raise IndexError("Pose index out of range")
+    
+    def get_total_poses(self) -> int:
+        """Get total number of odometry readings"""
+        return len(self.odom_readings)
+    
+    def get_pose_state(self, index: int) -> np.ndarray:
+        """Get pose state vector [x, y, theta] at index"""
+        if 0 <= index < len(self.odom_readings):
+            reading = self.odom_readings[index]
+            return np.array([reading.x, reading.y, reading.theta])
+        raise IndexError("Pose index out of range")
+    
+    def get_control_input(self, index: int) -> Optional[Tuple[float, float, float]]:
+        """
+        Get control input (v, omega) and time difference at index
+        
+        Returns:
+            tuple: (v, omega, dt) or None if at last pose
+        """
+        if index >= len(self.odom_readings) - 1:
+            return None
+        
+        current = self.odom_readings[index]
+        next_reading = self.odom_readings[index + 1]
+        
+        dt = next_reading.timestamp - current.timestamp
+        return current.v, current.omega, dt
+    
+    def get_laser_reading_at_time(self, timestamp: float, 
+                                tolerance: float = 0.1) -> Optional[LaserReading]:
+        """
+        Get laser reading closest to the given timestamp within tolerance
+        
+        Args:
+            timestamp: Target timestamp
+            tolerance: Maximum time difference allowed
+            
+        Returns:
+            LaserReading or None if no reading found within tolerance
+        """
+        for reading in self.laser_readings:
+            if abs(reading.timestamp - timestamp) < tolerance:
+                return reading
+        return None
+    
+    def get_time_range(self) -> Tuple[float, float]:
+        """Get the time range of the dataset"""
+        if not self.odom_readings:
+            raise ValueError("No odometry readings available")
+        
+        start_time = self.odom_readings[0].timestamp
+        end_time = self.odom_readings[-1].timestamp
+        return start_time, end_time
+    
+# <---------------DATASET HANDLING STUFF ---------------->
 
 # < -------------EKF STUFF ---------------->
 # --------> Robot parameters
@@ -211,62 +367,112 @@ def show_measurements(x, zs, env):
 
 # < -------------PLOTTING STUFF ---------------->
 if __name__=='__main__':
-
     # Initialize pygame
     pygame.init()
 
-    # Initialize robot and time step
-    x_init = np.array([1,1,np.pi/2])
-    robot = vehicles.DifferentialDrive(x_init)
-    dt = 0.01
+    # Initialize the CLF data loader
+    data_loader = CLFDataLoader("sample_data/sample_dataset.clf")
+    current_pose_index = 0
 
+    # Initialize robot with first pose from dataset
+    x_init = data_loader.get_pose_state(0)
+    robot = vehicles.DifferentialDrive(x_init)
+    
     # Initialize the state estimate
     mu[0:3] = np.expand_dims(x_init, axis=1)
     sigma[0:3, 0:3] = 0.1 * np.eye(3)
     sigma[2, 2] = 0
 
     # Initialize and display environment
-    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.png")
+    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank2.jpg")
 
     # List to store the path of the robot in pixel coordinates
     robot_path = []    
 
     running = True
-    u = np.array([0.,0.]) # Controls, forward/backward velocity, angular velocity
-    while running:
+    paused = False
+    clock = pygame.time.Clock()
+    
+    # Scale factor for visualization (adjust based on your data)
+    SCALE_FACTOR = 1.0  
+
+    while running and current_pose_index < data_loader.get_total_poses():
         for event in pygame.event.get():
-            if event.type==pygame.QUIT:
+            if event.type == pygame.QUIT:
                 running = False
-            u = robot.update_u(u,event) if event.type==pygame.KEYUP or event.type==pygame.KEYDOWN else u # Update controls based on key states
-        robot.move_step(u,dt) # Integrate EOMs forward, i.e., move robot
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    paused = not paused
+                elif event.key == pygame.K_UP:
+                    SCALE_FACTOR *= 1.1
+                elif event.key == pygame.K_DOWN:
+                    SCALE_FACTOR /= 1.1
+        
+        if not paused:
+            # Get control input from dataset
+            control_data = data_loader.get_control_input(current_pose_index)
+            if control_data is None:
+                break
+                
+            v, omega, dt = control_data
+            u = np.array([v, omega])
+            
+            # Move robot according to dataset
+            robot.move_step(u, dt)
 
-        # Get the current robot position in pixel coordinates
-        rx, ry, _ = robot.x
+            # Get current odometry reading
+            odom = data_loader.odom_readings[current_pose_index]
+            
+            # Get laser reading close to current timestamp if available
+            laser = data_loader.get_laser_reading_at_time(odom.timestamp)
+            
+            # If we have laser data, use it for measurements
+            if laser:
+                # Convert laser readings to landmark-like observations
+                zs = []
+                for i, range_val in enumerate(laser.ranges):
+                    if range_val < robot_fov:  # Only use readings within field of view
+                        angle = -np.pi/2 + i * np.pi/180  # Convert laser index to angle
+                        zs.append((range_val, angle, range_val/robot_fov, i))  # (range, bearing, signature, id)
+            else:
+                zs = sim_measurements(robot.get_pose(), landmarks)
+            
+            # EKF SLAM logic
+            mu, sigma = prediction_update(mu, sigma, u, dt)
+            mu, sigma = measurement_update(mu, sigma, zs)
+            
+            # Update visualization with scaling
+            rx, ry, _ = robot.x
+            rx_pix, ry_pix = env.position2pixel((rx * SCALE_FACTOR, ry * SCALE_FACTOR))
+            robot_path.append((rx_pix, ry_pix))
 
-        # Get measurements
-        zs = sim_measurements(robot.get_pose(), landmarks)
-        #EKF SLAM logic
-        mu, sigma = prediction_update(mu, sigma, u, dt)
-        mu, sigma = measurement_update(mu, sigma, zs)
-        rx_pix, ry_pix = env.position2pixel((rx, ry))
-        robot_path.append((rx_pix, ry_pix))  # Append current position to path
-        # Show ground truth
-        env.show_map() # Re-bluit map
-        env.show_robot(robot) # Re-bluit robot
-        show_landmark_location(landmarks, env)
-        show_measurements(robot.get_pose(), zs, env)
-        # Show EKF estimates
-        show_robot_estimate(mu, sigma, env)
-        show_landmark_estimate(mu, sigma, env)
-        if len (robot_path) > 1:
-            pygame.draw.lines(env.get_pygame_surface(), (0, 0, 0), False, robot_path, 2)  # Green path, 2-pixel width
-        pygame.display.update() # Update displaypython3 
+            print(rx_pix, ry_pix)
+            
+            # Show ground truth
+            env.show_map()
+            env.show_robot(robot)
+            
+            # Only show landmarks if we're using simulated measurements
+            if not laser:
+                show_landmark_location(landmarks, env)
+            show_measurements(robot.get_pose(), zs, env)
+            
+            # Show EKF estimates
+            show_robot_estimate(mu, sigma, env)
+            show_landmark_estimate(mu, sigma, env)
+            
+            if len(robot_path) > 1:
+                pygame.draw.lines(env.get_pygame_surface(), (0, 0, 0), False, robot_path, 2)
+            
+            pygame.display.update()
+            current_pose_index += 1
+            
+        clock.tick(60)  # Limit to 60 FPS
 
-
-    # Save the map with the path after the simulation ends
+    # Save the final map
     save_dir = "./maps/"
-    os.makedirs(save_dir, exist_ok=True)  # Create the directory if it doesn't exist
-    map_surface = env.get_pygame_surface()  # Get the pygame surface
+    os.makedirs(save_dir, exist_ok=True)
+    map_surface = env.get_pygame_surface()
     save_path = os.path.join(save_dir, "saved_map.png")
-    pygame.image.save(map_surface, save_path)  # Save the surface as an image
+    pygame.image.save(map_surface, save_path)
     print(f"Map saved as '{save_path}'")
