@@ -100,15 +100,15 @@ if __name__=='__main__':
         clock.tick(60)  # Maintain 60 FPS
 
     # Save paths to files
-    with open('robot_path_pixels.txt', 'w') as f:
-        f.write("x_pixel, y_pixel, heading_rad\\n")
+    with open('robot_path_pixels.clf', 'w') as f:
+        f.write("x_pixel, y_pixel, heading_rad\n")
         for point in path_save:
-            f.write(f"{point[0]}, {point[1]}, {point[2]}\n")
+            f.write(f"ODOM {point[0]}, {point[1]}, {point[2]}\n")
 
-    with open('robot_path_meters.txt', 'w') as f:
+    with open('robot_path_meters.clf', 'w') as f:
         f.write("x_meters, y_meters, heading_rad\n")
         for point in path_m_save:
-            f.write(f"{point[0]}, {point[1]}, {point[2]}\n")
+            f.write(f"ODOM {point[0]}, {point[1]}, {point[2]}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
