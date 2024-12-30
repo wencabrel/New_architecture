@@ -13,7 +13,7 @@ if __name__=='__main__':
     dt = 0.01
 
     # Initialize and display environment
-    env = environment.Environment(map_image_path="./maps/map_blank.png")
+    env = environment.Environment()
 
     running = True
     u = np.array([0.,0.]) # Controls

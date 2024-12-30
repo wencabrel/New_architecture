@@ -371,7 +371,7 @@ if __name__=='__main__':
     pygame.init()
 
     # Initialize the CLF data loader
-    data_loader = CLFDataLoader("sample_data/sample_dataset.clf")
+    data_loader = CLFDataLoader("sample_data/complex_path.clf")
     current_pose_index = 0
 
     # Initialize robot with first pose from dataset
@@ -384,7 +384,7 @@ if __name__=='__main__':
     sigma[2, 2] = 0
 
     # Initialize and display environment
-    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank2.jpg")
+    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.png")
 
     # List to store the path of the robot in pixel coordinates
     robot_path = []    
@@ -446,7 +446,9 @@ if __name__=='__main__':
             rx_pix, ry_pix = env.position2pixel((rx * SCALE_FACTOR, ry * SCALE_FACTOR))
             robot_path.append((rx_pix, ry_pix))
 
-            print(rx_pix, ry_pix)
+            # print(rx, ry)
+
+            # print(rx_pix, ry_pix)
             
             # Show ground truth
             env.show_map()
