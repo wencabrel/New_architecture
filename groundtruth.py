@@ -3,11 +3,19 @@ import numpy as np
 import pygame
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import time
+
+
+
 
 if __name__=='__main__':
     # Initialize pygame
     pygame.init()
 
+    # Initialize start time
+    start_time = time.time()
+    
+    
     # Initialize matplotlib figure
     plt.ion()  # Turn on interactive mode
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -34,6 +42,9 @@ if __name__=='__main__':
     robot = vehicles.DifferentialDrive(x_init)
     dt = 0.01
 
+    # Get current timestamp
+    current_time = time.time() - start_time
+
     path_save = []
     path_m_save = []
 
@@ -56,17 +67,20 @@ if __name__=='__main__':
                 running = False
             elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
                 u = robot.update_u(u, event)
-        
+         
         # Move robot
         robot.move_step(u, dt)
         
         # Update positions
         rx, ry, phi = robot.x
+        # u[0] is translational velocity, u[1] is rotational velocity
+        v_trans, v_rot = u[0], u[1] 
+        # convert to pixel
         rx_pix, ry_pix = env.position2pixel((rx,ry))
-        path_save.append((rx_pix, ry_pix, phi))
-        
+        path_save.append((rx_pix, ry_pix, phi, v_trans, v_rot))
+        # convert to meters
         rx_m, ry_m = env.pixel2position((rx_pix, ry_pix))
-        path_m_save.append((rx_m, ry_m, phi))
+        path_m_save.append((rx_m, ry_m, phi, v_trans, v_rot))
         
         # Update pygame display
         env.show_map()
@@ -101,14 +115,14 @@ if __name__=='__main__':
 
     # Save paths to files
     with open('robot_path_pixels.clf', 'w') as f:
-        f.write("x_pixel, y_pixel, heading_rad\n")
+        f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_save:
-            f.write(f"ODOM {point[0]}, {point[1]}, {point[2]}\n")
+            f.write(f"ODOM {point[0]: .4f}, {point[1]: .4f}, {point[2]: .4f}, {point[3]: .4f}, {point[4]: .4f}, {0}, {start_time: .3f}, iRoC, {time.time() - start_time: .3f}\n")
 
     with open('robot_path_meters.clf', 'w') as f:
-        f.write("x_meters, y_meters, heading_rad\n")
+        f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_m_save:
-            f.write(f"ODOM {point[0]}, {point[1]}, {point[2]}\n")
+            f.write(f"ODOM {point[0]: .4f}, {point[1]: .4f}, {point[2]: .4f}, {point[3]: .4f}, {point[4]: .4f}, {0}, {start_time: .3f}, iRoC, {time.time()- start_time: .3f}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
