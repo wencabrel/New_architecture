@@ -61,12 +61,12 @@ if __name__=='__main__':
         robot.move_step(u, dt)
         
         # Update positions
-        rx, ry, _ = robot.x
+        rx, ry, phi = robot.x
         rx_pix, ry_pix = env.position2pixel((rx,ry))
-        path_save.append((rx_pix, ry_pix))
+        path_save.append((rx_pix, ry_pix, phi))
         
         rx_m, ry_m = env.pixel2position((rx_pix, ry_pix))
-        path_m_save.append((rx_m, ry_m))
+        path_m_save.append((rx_m, ry_m, phi))
         
         # Update pygame display
         env.show_map()
@@ -101,14 +101,14 @@ if __name__=='__main__':
 
     # Save paths to files
     with open('robot_path_pixels.txt', 'w') as f:
-        f.write("x_pixel,y_pixel\n")
+        f.write("x_pixel, y_pixel, heading_rad\\n")
         for point in path_save:
-            f.write(f"{point[0]},{point[1]}\n")
+            f.write(f"{point[0]}, {point[1]}, {point[2]}\n")
 
     with open('robot_path_meters.txt', 'w') as f:
-        f.write("x_meters,y_meters\n")
+        f.write("x_meters, y_meters, heading_rad\n")
         for point in path_m_save:
-            f.write(f"{point[0]},{point[1]}\n")
+            f.write(f"{point[0]}, {point[1]}, {point[2]}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
