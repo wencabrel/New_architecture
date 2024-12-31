@@ -43,13 +43,13 @@ def plot_path_comparison(predicted_file_path, ground_truth_file_path):
     
     # Create the plot
     plt.figure(figsize=(10, 8))
-    plt.plot(predicted_path[:, 0], predicted_path[:, 1], 'b-', label='Predicted Path', linewidth=2)
-    plt.plot(ground_truth_path[:, 0], ground_truth_path[:, 1], 'r--', label='Ground Truth', linewidth=2)
+    plt.plot(predicted_path[:, 0], predicted_path[:, 1], 'b-', label='Predicted Path', linewidth=5)
+    plt.plot(ground_truth_path[:, 0], ground_truth_path[:, 1], 'g--', label='Ground Truth', linewidth=3)
     
     plt.title('Robot Path Comparison')
     plt.xlabel('X Position (meters)')
     plt.ylabel('Y Position (meters)')
-    plt.grid(True)
+    plt.grid(False)
     plt.legend()
     
     # Make axes equal to preserve shape

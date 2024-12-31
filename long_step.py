@@ -470,7 +470,7 @@ if __name__=='__main__':
             pygame.display.update()
             current_pose_index += 1
             
-        clock.tick(60)  # Limit to 60 FPS
+        clock.tick(160)  # Limit to 60 FPS
 
     # Save the final map
     save_dir = "./maps/"

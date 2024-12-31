@@ -24,13 +24,13 @@ if __name__=='__main__':
     ax1.set_title('Robot Path Trajectory (Pixels)')
     ax1.set_xlabel('X Position (pixels)')
     ax1.set_ylabel('Y Position (pixels)')
-    ax1.grid(True)
+    ax1.grid(False)
     ax1.legend()
     
     ax2.set_title('Robot Path Trajectory (Meters)')
     ax2.set_xlabel('X Position (meters)')
     ax2.set_ylabel('Y Position (meters)')
-    ax2.grid(True)
+    ax2.grid(False)
     ax2.legend()
     
     plt.tight_layout()
