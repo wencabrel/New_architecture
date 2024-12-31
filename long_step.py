@@ -371,7 +371,7 @@ if __name__=='__main__':
     pygame.init()
 
     # Initialize the CLF data loader
-    data_loader = CLFDataLoader("sample_data/complex_path.clf")
+    data_loader = CLFDataLoader("sample_data/merged.clf")
     current_pose_index = 0
 
     # Initialize robot with first pose from dataset
