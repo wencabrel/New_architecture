@@ -12,7 +12,7 @@ def generate_circular_path():
     x, y, theta = 5.0, 5.0, 0.0
     
     # Parameters for motion
-    dt = 0.1  # Time step between measurements
+    dt = 0.01  # Time step between measurements
     v = 0.2   # Forward velocity (m/s)
     radius = 2.0  # Radius of the circular path
     
@@ -64,7 +64,7 @@ def generate_circular_path():
 sample_data = generate_circular_path()
 
 # Save to file
-with open('sample_data/complex_path.clf', 'w') as f:
+with open('complex_path.clf', 'w') as f:
     for line in sample_data:
         f.write(line + '\n')
 

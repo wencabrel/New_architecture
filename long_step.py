@@ -371,7 +371,7 @@ if __name__=='__main__':
     pygame.init()
 
     # Initialize the CLF data loader
-    data_loader = CLFDataLoader("sample_data/merged.clf")
+    data_loader = CLFDataLoader("robot_path_meters.clf")
     current_pose_index = 0
 
     # Initialize robot with first pose from dataset
@@ -384,7 +384,7 @@ if __name__=='__main__':
     sigma[2, 2] = 0
 
     # Initialize and display environment
-    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.png")
+    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.jpg")
 
     # List to store the path of the robot in pixel coordinates
     robot_path = []    
@@ -395,6 +395,8 @@ if __name__=='__main__':
     
     # Scale factor for visualization (adjust based on your data)
     SCALE_FACTOR = 1.0  
+
+    path_m_save = []
 
     while running and current_pose_index < data_loader.get_total_poses():
         for event in pygame.event.get():
@@ -443,12 +445,11 @@ if __name__=='__main__':
             
             # Update visualization with scaling
             rx, ry, _ = robot.x
-            rx_pix, ry_pix = env.position2pixel((rx * SCALE_FACTOR, ry * SCALE_FACTOR))
+            rx_pix, ry_pix = env.position2pixel((rx, ry))
             robot_path.append((rx_pix, ry_pix))
 
-            # print(rx, ry)
-
-            # print(rx_pix, ry_pix)
+            rx_m, ry_m = env.pixel2position((rx_pix, ry_pix))
+            path_m_save.append((rx_m, ry_m))
             
             # Show ground truth
             env.show_map()
@@ -473,8 +474,16 @@ if __name__=='__main__':
 
     # Save the final map
     save_dir = "./maps/"
+    predicted_path_file = "predicted_data/predicted_path.txt"
     os.makedirs(save_dir, exist_ok=True)
     map_surface = env.get_pygame_surface()
     save_path = os.path.join(save_dir, "saved_map.png")
     pygame.image.save(map_surface, save_path)
     print(f"Map saved as '{save_path}'")
+    with open(predicted_path_file, 'w') as f:
+        # Write a header (optional)
+        f.write("x_meters y_meters\n")
+        # Write each point
+        for point in path_m_save:
+            f.write(f"{point[0]:.3f} {point[1]:.3f}\n")
+        print(f"Predicted path saved as {predicted_path_file}")

@@ -6,8 +6,6 @@ from matplotlib.animation import FuncAnimation
 import time
 
 
-
-
 if __name__=='__main__':
     # Initialize pygame
     pygame.init()
@@ -43,13 +41,15 @@ if __name__=='__main__':
     dt = 0.01
 
     # Get current timestamp
-    current_time = time.time() - start_time
+    current_time = time.time()
+
+    end_timestamp = 0.0
 
     path_save = []
     path_m_save = []
 
     # Initialize and display environment
-    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.png")
+    env = environment.Environment(map_image_path="./python_ugv_sim/maps/map_blank.jpg")
 
     running = True
     u = np.array([0.,0.]) # Controls
@@ -61,26 +61,28 @@ if __name__=='__main__':
     clock = pygame.time.Clock()  # Add clock for consistent frame rate
 
     while running:
-        # Handle pygame events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            u = robot.update_u(u,event) if event.type==pygame.KEYUP or event.type==pygame.KEYDOWN else u # Update controls based on key states
+            elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                u = robot.update_u(u, event)
          
         # Move robot
         robot.move_step(u, dt)
-        
+
         # Update positions
         rx, ry, phi = robot.x
+        current_time += dt
+        end_timestamp += dt
+
         # u[0] is translational velocity, u[1] is rotational velocity
         v_trans, v_rot = u[0], u[1] 
-        # print(v_trans, v_rot)
         # convert to pixel
         rx_pix, ry_pix = env.position2pixel((rx, ry))
-        path_save.append((rx_pix, ry_pix, phi, v_trans, v_rot))
+        path_save.append((rx_pix, ry_pix, phi, v_trans, v_rot, current_time, end_timestamp))
         # convert to meters
         rx_m, ry_m = env.pixel2position((rx_pix, ry_pix))
-        path_m_save.append((rx_m, ry_m, phi, v_trans, v_rot))
+        path_m_save.append((rx_m, ry_m, phi, v_trans, v_rot, current_time, end_timestamp))
         
         # Update pygame display
         env.show_map()
@@ -117,12 +119,12 @@ if __name__=='__main__':
     with open('robot_path_pixels.clf', 'w') as f:
         # f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_save:
-            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time() - start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {point[5]: .3f} iRoC {point[6]: .3f}\n")
 
     with open('robot_path_meters.clf', 'w') as f:
         # f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_m_save:
-            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time()- start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {point[5]: .3f} iRoC {point[6]: .3f}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
