@@ -65,8 +65,7 @@ if __name__=='__main__':
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
-                u = robot.update_u(u, event)
+            u = robot.update_u(u,event) if event.type==pygame.KEYUP or event.type==pygame.KEYDOWN else u # Update controls based on key states
          
         # Move robot
         robot.move_step(u, dt)
@@ -75,8 +74,9 @@ if __name__=='__main__':
         rx, ry, phi = robot.x
         # u[0] is translational velocity, u[1] is rotational velocity
         v_trans, v_rot = u[0], u[1] 
+        print(v_trans, v_rot)
         # convert to pixel
-        rx_pix, ry_pix = env.position2pixel((rx,ry))
+        rx_pix, ry_pix = env.position2pixel((rx, ry))
         path_save.append((rx_pix, ry_pix, phi, v_trans, v_rot))
         # convert to meters
         rx_m, ry_m = env.pixel2position((rx_pix, ry_pix))
@@ -111,18 +111,18 @@ if __name__=='__main__':
             except:
                 pass  # Ignore any plotting errors to keep robot control smooth
         
-        clock.tick(60)  # Maintain 60 FPS
+        clock.tick(160)  # Maintain 60 FPS
 
     # Save paths to files
     with open('robot_path_pixels.clf', 'w') as f:
         f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_save:
-            f.write(f"ODOM {point[0]: .4f}, {point[1]: .4f}, {point[2]: .4f}, {point[3]: .4f}, {point[4]: .4f}, {0}, {start_time: .3f}, iRoC, {time.time() - start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time() - start_time: .3f}\n")
 
     with open('robot_path_meters.clf', 'w') as f:
         f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_m_save:
-            f.write(f"ODOM {point[0]: .4f}, {point[1]: .4f}, {point[2]: .4f}, {point[3]: .4f}, {point[4]: .4f}, {0}, {start_time: .3f}, iRoC, {time.time()- start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC, {time.time()- start_time: .3f}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
