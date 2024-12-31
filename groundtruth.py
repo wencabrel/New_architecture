@@ -74,7 +74,7 @@ if __name__=='__main__':
         rx, ry, phi = robot.x
         # u[0] is translational velocity, u[1] is rotational velocity
         v_trans, v_rot = u[0], u[1] 
-        print(v_trans, v_rot)
+        # print(v_trans, v_rot)
         # convert to pixel
         rx_pix, ry_pix = env.position2pixel((rx, ry))
         path_save.append((rx_pix, ry_pix, phi, v_trans, v_rot))
@@ -115,14 +115,14 @@ if __name__=='__main__':
 
     # Save paths to files
     with open('robot_path_pixels.clf', 'w') as f:
-        f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
+        # f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_save:
-            f.write(f"ODOM {point[0]: .3} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time() - start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time() - start_time: .3f}\n")
 
     with open('robot_path_meters.clf', 'w') as f:
-        f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
+        # f.write("x_pixel, y_pixel, heading_rad,velocity_trans,velocity_rot, 0, start_timestamp, iRoc, end_timestamp\n")
         for point in path_m_save:
-            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC, {time.time()- start_time: .3f}\n")
+            f.write(f"ODOM {point[0]: .3f} {point[1]: .3f} {point[2]: .3f} {point[3]: .3f} {point[4]: .3f} {0} {start_time: .3f} iRoC {time.time()- start_time: .3f}\n")
 
     # Save final plot
     plt.savefig('robot_path_plots.png')
