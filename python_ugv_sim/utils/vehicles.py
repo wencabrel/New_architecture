@@ -1,8 +1,8 @@
 '''
 Script for vehicle classes and functions
 '''
-import pygame
-from pygame.locals import Rect
+# import pygame
+# from pygame.locals import Rect
 import numpy as np
 import scipy
 
@@ -81,26 +81,26 @@ class DifferentialDrive(Robot):
         return self.x
     def get_position(self):
         return self.x[0:2]
-    def update_u(self,u,key_event):
-        '''
-        Update controls
-        '''
-        if key_event.type==pygame.KEYDOWN:
-            if key_event.key==pygame.K_LEFT:
-                u[1] = self.max_omega
-            elif key_event.key==pygame.K_RIGHT:
-                u[1] = -1*self.max_omega
-            if key_event.key==pygame.K_UP:
-                u[0] = self.max_v
-            elif key_event.key==pygame.K_DOWN:
-                u[0] = -1*self.max_v
-        if key_event.type==pygame.KEYUP:
-            if key_event.key==pygame.K_LEFT:
-                u[1] = 0
-            elif key_event.key==pygame.K_RIGHT:
-                u[1] = 0
-            if key_event.key==pygame.K_UP:
-                u[0] = 0
-            elif key_event.key==pygame.K_DOWN:
-                u[0] = 0
-        return u
+    # def update_u(self,u,key_event):
+    #     '''
+    #     Update controls
+    #     '''
+    #     if key_event.type==pygame.KEYDOWN:
+    #         if key_event.key==pygame.K_LEFT:
+    #             u[1] = self.max_omega
+    #         elif key_event.key==pygame.K_RIGHT:
+    #             u[1] = -1*self.max_omega
+    #         if key_event.key==pygame.K_UP:
+    #             u[0] = self.max_v
+    #         elif key_event.key==pygame.K_DOWN:
+    #             u[0] = -1*self.max_v
+    #     if key_event.type==pygame.KEYUP:
+    #         if key_event.key==pygame.K_LEFT:
+    #             u[1] = 0
+    #         elif key_event.key==pygame.K_RIGHT:
+    #             u[1] = 0
+    #         if key_event.key==pygame.K_UP:
+    #             u[0] = 0
+    #         elif key_event.key==pygame.K_DOWN:
+    #             u[0] = 0
+    #     return u
