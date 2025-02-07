@@ -428,12 +428,12 @@ class EKFSLAMVisualizer:
 if __name__=='__main__':
     try:
         # Initialize the CLF data loader with limited entries
-        data_loader = CLFDataLoader("sample_data/mit-killian.clf", max_entries=5000)
+        data_loader = CLFDataLoader("sample_data/mit-killian.clf", max_entries=5200)
         
         # Create and run the visualizer
         visualizer = EKFSLAMVisualizer(data_loader)
         print("Starting animation...")
-        anim = visualizer.animate(interval=50)  # 50ms interval for smoother animation
+        anim = visualizer.animate(interval = 30)  # 50ms interval for smoother animation
         
     except Exception as e:
         print(f"Error occurred: {e}")
