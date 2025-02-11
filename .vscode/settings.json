@@ -1,5 +1,6 @@
 {
     "python.analysis.extraPaths": [
         "./python_ugv_sim/utils"
-    ]
+    ],
+    "editor.fontSize": 17
 }
