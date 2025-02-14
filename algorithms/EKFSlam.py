@@ -209,18 +209,16 @@ class EKFSlamAdapter:
 
 def processSensorData(ekf_slam, sensor_data):
     """
-    Process all sensor data through EKF SLAM.
+    Process all sensor data through EKF SLAM and save visualizations.
     
     Args:
         ekf_slam: Initialized EKF SLAM instance
         sensor_data: Dictionary of sensor readings
     """
     count = 0
-    plt.figure(figsize=(19.20, 19.20))
     
     # For trajectory visualization
     x_trajectory, y_trajectory = [], []
-    colors = iter(cm.rainbow(np.linspace(1, 0, len(sensor_data) + 1)))
     
     # Process each reading
     for key in sorted(sensor_data.keys()):
@@ -234,18 +232,45 @@ def processSensorData(ekf_slam, sensor_data):
         x_trajectory.append(final_reading['x'])
         y_trajectory.append(final_reading['y'])
         
-        # Visualize current position
-        if count % 1 == 0:
-            plt.scatter(x_trajectory[-1], y_trajectory[-1], 
-                       color=next(colors), s=35)
+        # Create new figure for this iteration
+        plt.figure(figsize=(19.20, 19.20))
+        
+        # Plot trajectory
+        colors = iter(cm.rainbow(np.linspace(1, 0, len(x_trajectory) + 1)))
+        for i in range(len(x_trajectory)):
+            plt.scatter(x_trajectory[i], y_trajectory[i], color=next(colors), s=35)
+            
+        # Highlight start and current position
+        plt.scatter(x_trajectory[0], y_trajectory[0], color='r', s=500)
+        plt.scatter(x_trajectory[-1], y_trajectory[-1], color=next(colors), s=500)
+        plt.plot(x_trajectory, y_trajectory)
+        
+        # Plot current map state
+        xRange, yRange = [-13, 20], [-25, 7]
+        ogMap = ekf_slam.og.occupancyGridVisited / ekf_slam.og.occupancyGridTotal
+        xIdx, yIdx = ekf_slam.og.convertRealXYToMapIdx(xRange, yRange)
+        ogMap = ogMap[yIdx[0]: yIdx[1], xIdx[0]: xIdx[1]]
+        ogMap = np.flipud(1 - ogMap)
+        plt.imshow(ogMap, cmap='gray', extent=[xRange[0], xRange[1], yRange[0], yRange[1]])
+        
+        # Save the figure
+        plt.savefig(f'../Output/ekf_{str(count).zfill(3)}.png')
+        plt.close()
     
-    # Final visualization
+    # Create final visualization
+    plt.figure(figsize=(19.20, 19.20))
+    colors = iter(cm.rainbow(np.linspace(1, 0, len(x_trajectory) + 1)))
+    for i in range(len(x_trajectory)):
+        plt.scatter(x_trajectory[i], y_trajectory[i], color=next(colors), s=35)
+    
     plt.scatter(x_trajectory[0], y_trajectory[0], color='r', s=500)
     plt.scatter(x_trajectory[-1], y_trajectory[-1], color=next(colors), s=500)
     plt.plot(x_trajectory, y_trajectory)
     
     # Plot final map
     ekf_slam.og.plotOccupancyGrid([-13, 20], [-25, 7], plotThreshold=False)
+    plt.savefig('../Output/ekf_final.png')
+    plt.close()
 
 def readJson(json_file):
     """
