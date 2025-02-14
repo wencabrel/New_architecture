@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 class OccupancyGrid:
-    def __init__(self, mapXLength, mapYLength, initXY, unitGridSize, lidarFOV, numSamplesPerRev, lidarMaxRange, wallThickness):
+    def __init__(self, mapXLength, mapYLength, initXY, unitGridSize, lidarFOV, numSamplesPerRev, lidarMaxRange, wallThickness, 
+                 viewXRange=None, viewYRange=None):
         xNum = int(mapXLength / unitGridSize)
         yNum = int(mapYLength / unitGridSize)
         x = np.linspace(-xNum * unitGridSize / 2, xNum * unitGridSize / 2, num=xNum + 1) + initXY['x']
@@ -27,6 +28,10 @@ class OccupancyGrid:
         self.radByY = radByY
         self.radByR = radByR
         self.spokesStartIdx = int(((self.numSpokes / 2 - self.numSamplesPerRev) / 2) % self.numSpokes)
+        
+        # Set view ranges
+        self.viewXRange = viewXRange if viewXRange is not None else self.mapXLim
+        self.viewYRange = viewYRange if viewYRange is not None else self.mapYLim
         
         # Initialize plot
         plt.ion()  # Turn on interactive mode
@@ -87,23 +92,19 @@ class OccupancyGrid:
             return (np.asarray(emptyXList), np.asarray(emptyYList), 
                    np.asarray(occupiedXList), np.asarray(occupiedYList))
 
-    def plot_current_state(self, xRange=None, yRange=None):
+    def plot_current_state(self):
         """Plot the current state of the occupancy grid and trajectory"""
         self.ax.clear()
         
-        if xRange is None or xRange[0] < self.mapXLim[0] or xRange[1] > self.mapXLim[1]:
-            xRange = self.mapXLim
-        if yRange is None or yRange[0] < self.mapYLim[0] or yRange[1] > self.mapYLim[1]:
-            yRange = self.mapYLim
-            
         ogMap = self.occupancyGridVisited / self.occupancyGridTotal
-        xIdx, yIdx = self.convertRealXYToMapIdx(xRange, yRange)
+        xIdx, yIdx = self.convertRealXYToMapIdx(self.viewXRange, self.viewYRange)
         ogMap = ogMap[yIdx[0]: yIdx[1], xIdx[0]: xIdx[1]]
         ogMap = np.flipud(1 - ogMap)
         
         # Plot occupancy grid
         self.ax.imshow(ogMap, cmap='gray', 
-                      extent=[xRange[0], xRange[1], yRange[0], yRange[1]])
+                      extent=[self.viewXRange[0], self.viewXRange[1], 
+                             self.viewYRange[0], self.viewYRange[1]])
         
         # Plot trajectory
         if len(self.trajectory_x) > 0:
@@ -116,6 +117,11 @@ class OccupancyGrid:
         
         self.ax.set_title(f'Step {len(self.trajectory_x)}')
         self.ax.legend()
+        
+        # Set fixed axis limits
+        self.ax.set_xlim(self.viewXRange)
+        self.ax.set_ylim(self.viewYRange)
+        
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         plt.pause(0.01)  # Short pause to allow the plot to update
@@ -221,6 +227,10 @@ def main():
     lidarMaxRange = 10  # meters
     wallThickness = 7 * unitGridSize
 
+    # Set view ranges (same as in original code)
+    viewXRange = [-12, 20]
+    viewYRange = [-23.5, 7]
+
     # Load sensor data
     jsonFile = "../DataSet/DataPreprocessed/intel-gfs"
     with open(jsonFile, 'r') as f:
@@ -233,9 +243,10 @@ def main():
     # Get initial position
     initXY = sensorData[sorted(sensorData.keys())[0]]
 
-    # Initialize OccupancyGrid
+    # Initialize OccupancyGrid with view ranges
     og = OccupancyGrid(initMapXLength, initMapYLength, initXY, unitGridSize, 
-                       lidarFOV, numSamplesPerRev, lidarMaxRange, wallThickness)
+                       lidarFOV, numSamplesPerRev, lidarMaxRange, wallThickness,
+                       viewXRange, viewYRange)
 
     # Process each sensor reading
     count = 0
