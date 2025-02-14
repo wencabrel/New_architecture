@@ -38,6 +38,9 @@ class OccupancyGrid:
         self.fig, self.ax = plt.subplots(figsize=(12, 12))
         self.trajectory_x = []
         self.trajectory_y = []
+        
+        # Initialize color iterator for trajectory
+        self.colors = iter(cm.rainbow(np.linspace(1, 0, 1)))
 
     def updateOccupancyGrid(self, reading, dTheta=0, update=True):
         x, y, theta, rMeasure = reading['x'], reading['y'], reading['theta'], reading['range']
@@ -106,14 +109,24 @@ class OccupancyGrid:
                       extent=[self.viewXRange[0], self.viewXRange[1], 
                              self.viewYRange[0], self.viewYRange[1]])
         
-        # Plot trajectory
+        # Plot trajectory with rainbow colors
         if len(self.trajectory_x) > 0:
-            self.ax.plot(self.trajectory_x, self.trajectory_y, 'b-', linewidth=1)
+            # Create new color iterator for all points
+            colors = iter(cm.rainbow(np.linspace(1, 0, len(self.trajectory_x) + 1)))
+            
+            # Plot each point with its own color
+            for i in range(len(self.trajectory_x)):
+                self.ax.scatter(self.trajectory_x[i], self.trajectory_y[i], 
+                              color=next(colors), s=35)
+            
+            # Plot the trajectory line
+            self.ax.plot(self.trajectory_x, self.trajectory_y, 'b-', linewidth=1, alpha=0.5)
+            
+            # Highlight start and end points
+            self.ax.scatter(self.trajectory_x[0], self.trajectory_y[0], 
+                          color='r', s=500, label='Start Position')
             self.ax.scatter(self.trajectory_x[-1], self.trajectory_y[-1], 
-                          color='red', s=100, label='Current Position')
-            if len(self.trajectory_x) > 1:
-                self.ax.scatter(self.trajectory_x[0], self.trajectory_y[0], 
-                              color='green', s=100, label='Start Position')
+                          color=next(colors), s=500, label='Current Position')
         
         self.ax.set_title(f'Step {len(self.trajectory_x)}')
         self.ax.legend()
