@@ -65,8 +65,8 @@ def format_flaser_data(input_filename, output_filename, inf_replacement=29.90, d
 # Script configuration - MODIFY THESE VALUES
 if __name__ == "__main__":
     # File paths - change these to your desired input and output paths
-    input_file = "../DataSet/RawData/laser_data.clf"
-    output_file = "../DataSet/RawData/raw_data_zjnu20_21_3F.clf"
+    input_file = "../DataSet/RawData/raw_data_zjnu20_21_3F.clf"
+    output_file = "../DataSet/RawData/raw_data_zjnu20_21_3F_clf"
     
     # Settings
     inf_replacement = 29.90  # Value to replace 'inf' with
