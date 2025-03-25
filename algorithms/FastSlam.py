@@ -369,7 +369,7 @@ def main():
     init_map_y_length = 50  # meters
     grid_size = 0.02  # meters per grid cell
     lidar_fov = np.pi  # field of view in radians
-    lidar_max_range = 10  # meters
+    lidar_max_range = 12  # meters
     wall_thickness = 5 * grid_size
     
     # Scan matching parameters
@@ -384,7 +384,7 @@ def main():
     coarse_factor = 5  # factor for coarse-to-fine scan matching
     
     # Load sensor data from file
-    sensor_data = readJson("../DataSet/DataPreprocessed/intel-gfs")
+    sensor_data = readJson("../DataSet/DataPreprocessed/zjnu20_21_20-gfs")
     
     # Get number of samples per revolution from first reading
     samples_per_rev = len(sensor_data[list(sensor_data)[0]]['range'])
