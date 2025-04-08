@@ -307,7 +307,7 @@ def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Scan Matcher Example')
     parser.add_argument('--file', '-f', type=str, 
-                       default="../dataset/raw_data/raw_data_zjnu20_21_3F.clf",
+                       default="../dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
                        help='Path to the LiDAR data file')
     parser.add_argument('--max-entries', '-m', type=int, default=500,
                        help='Maximum number of entries to read from the file')

@@ -13,6 +13,7 @@ import os
 import sys
 import argparse
 import time
+import matplotlib.pyplot as plt
 
 from lidar_processing import data_parser, scan_converter
 from mapping import occupancy_grid
@@ -24,10 +25,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='LiDAR Data Visualization and Mapping')
     
     parser.add_argument('--file', '-f', type=str, 
-                        default="./dataset/raw_data/raw_data_zjnu20_21_3F.clf",
+                        default="./dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
                         help='Path to the LiDAR data file')
     
-    parser.add_argument('--max-entries', '-m', type=int, default=1000,
+    parser.add_argument('--max-entries', '-m', type=int, default=500,
                         help='Maximum number of entries to read from the file')
     
     parser.add_argument('--grid', '-g', action='store_true', default=True,
@@ -150,6 +151,9 @@ def visualize_lidar_data_realtime(args):
     # Create output directory for maps if needed
     if args.save and args.grid:
         file_utils.ensure_directory_exists(args.output_dir)
+    
+    # Clear any existing plots to avoid multiple windows
+    plt.close('all')
     
     # Create and run the visualizer
     viz = lidar_visualizer.LiDARVisualizer(
