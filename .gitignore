@@ -1,4 +1,6 @@
 maps/*
+lidar_slam/maps/*
+lidar_slam/examples/maps/*
 sample_data/*
 Output/*
 DataSet/RawData/laser_data.clf
