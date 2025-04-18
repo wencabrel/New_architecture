@@ -15,8 +15,8 @@ from enum import Enum
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import required modules from existing system
-from lidar_processing import data_parser, scan_converter
-from lidar_processing.scan_matcher import ScanMatcher, MatchingAlgorithm, convert_scan_to_cartesian
+from lidar_processing import scan_converter
+from lidar_processing.scan_matcher import ScanMatcher
 from pose_estimation.pose_estimator import PoseEstimator, PoseEstimationMethod, Pose2D
 from mapping import occupancy_grid
 
@@ -40,8 +40,8 @@ class SLAMCoordinator:
         self.mode = mode
         self.grid_resolution = grid_resolution
         
-        # Initialize components
-        self.scan_matcher = ScanMatcher(algorithm=MatchingAlgorithm.ICP)
+        # Occupancy grid will be initialized when first scan is processed
+        self.occupancy_grid = None
         
         # Choose pose estimation method based on SLAM mode
         pose_method = PoseEstimationMethod.ODOMETRY_ONLY
@@ -50,8 +50,18 @@ class SLAMCoordinator:
         
         self.pose_estimator = PoseEstimator(method=pose_method)
         
-        # Occupancy grid will be initialized when first scan is processed
-        self.occupancy_grid = None
+        # Initialize scan matcher (will be set up properly after grid is created)
+        self.scan_matcher = None
+        self.scan_matcher_params = {
+            'search_radius': 1.4,
+            'search_half_rad': 0.25,
+            'scan_sigma_in_num_grid': 2,
+            'move_r_sigma': 0.1,
+            'max_move_deviation': 0.25,
+            'turn_sigma': 0.3,
+            'mismatch_prob_at_coarse': 0.15,
+            'coarse_factor': 5
+        }
         
         # For storing previous scan data
         self.previous_scan = None
@@ -84,6 +94,42 @@ class SLAMCoordinator:
             config (dict): Dictionary of configuration parameters
         """
         self.scan_config = config
+    
+    def _initialize_scan_matcher(self):
+        """Initialize the scan matcher with the occupancy grid"""
+        if self.occupancy_grid and not self.scan_matcher:
+            # Create the scan matcher with our occupancy grid
+            self.scan_matcher = ScanMatcher(
+                occupancy_grid_map=self.occupancy_grid,
+                **self.scan_matcher_params
+            )
+            
+            # Set LiDAR parameters based on what we've seen
+            lidar_max_range = 10.0  # Default range
+            num_samples = 180  # Default number of samples
+            
+            if self.previous_scan:
+                # Estimate max range from the data
+                max_range_in_data = max(self.previous_scan['scan_ranges'])
+                if max_range_in_data > 0:
+                    lidar_max_range = max(10.0, max_range_in_data * 1.1)  # Add 10% margin
+                
+                # Get number of samples from the data
+                num_samples = len(self.previous_scan['scan_ranges'])
+            
+            # Set LiDAR parameters in scan matcher
+            self.scan_matcher.set_lidar_params(
+                max_range=lidar_max_range,
+                field_of_view=self.angle_max - self.angle_min,
+                num_samples=num_samples
+            )
+            
+            # Also set in occupancy grid
+            self.occupancy_grid.set_lidar_params(
+                max_range=lidar_max_range,
+                field_of_view=self.angle_max - self.angle_min,
+                num_samples=num_samples
+            )
     
     def process_scan(self, parsed_data):
         """
@@ -120,8 +166,12 @@ class SLAMCoordinator:
             self.occupancy_grid = occupancy_grid.OccupancyGrid(
                 resolution=self.grid_resolution,
                 width=grid_width * self.grid_resolution,
-                height=grid_height * self.grid_resolution
+                height=grid_height * self.grid_resolution,
+                init_position=raw_pose  # Store initial position in metadata
             )
+            
+            # Initialize scan matcher now that we have a grid
+            self._initialize_scan_matcher()
             
             # Set initial pose as the first grid update reference
             self.initial_pose = current_pose.copy()
@@ -137,12 +187,6 @@ class SLAMCoordinator:
         
         # Combine into a single array of points
         current_scan_points = np.column_stack((x_points, y_points))
-        
-        # Apply coordinate transformations if necessary
-        if self.scan_config['flip_x']:
-            current_scan_points[:, 0] = -current_scan_points[:, 0]
-        if self.scan_config['flip_y']:
-            current_scan_points[:, 1] = -current_scan_points[:, 1]
         
         # Calculate odometry update (relative movement since last scan)
         delta_pose = None
@@ -165,44 +209,58 @@ class SLAMCoordinator:
         match_result = None
         
         if (self.mode != SLAMMode.ODOMETRY_ONLY and 
-            self.previous_scan_points is not None and 
+            self.previous_scan is not None and 
             self.scan_counter % self.scan_match_interval == 0 and
             len(current_scan_points) >= self.min_points_for_matching and
             len(self.previous_scan_points) >= self.min_points_for_matching):
             
-            # For scan matching, the "source" is the previous scan,
-            # and the "target" is the current scan transformed by the odometry update
+            # Use scan matcher to align current scan with the map
             try:
-                # Use odometry as initial guess for scan matcher
-                initial_guess = None
-                if delta_pose is not None:
-                    initial_guess = delta_pose
+                # Get estimated pose from odometry or previous correction
+                initial_pose = self.pose_estimator.get_current_pose().to_dict()
                 
-                # Perform scan matching
-                match_result = self.scan_matcher.match_scans(
-                    self.previous_scan_points, 
-                    current_scan_points,
-                    initial_guess
+                # Previous and current motion information for scan matcher
+                est_moving_dist = 0
+                est_moving_theta = None
+                
+                if delta_pose:
+                    est_moving_dist = np.sqrt(delta_pose[0]**2 + delta_pose[1]**2)
+                    if est_moving_dist > 0.1:  # Significant movement
+                        est_moving_theta = np.arctan2(delta_pose[1], delta_pose[0])
+                
+                # Perform scan matching to align the scan with the map
+                match_result = self.scan_matcher.match_scan(
+                    parsed_data,
+                    initial_pose,
+                    est_moving_dist,
+                    est_moving_theta
                 )
                 
-                # Store result for debugging
-                self.scan_match_results.append(match_result)
+                # Store scan matching information for debugging
+                matched_pose, confidence = match_result
+                match_info = {
+                    'matched_pose': matched_pose,
+                    'confidence': confidence,
+                    'time': time.time(),
+                    'frame': self.scan_counter
+                }
+                self.scan_match_results.append(match_info)
                 
                 # Update pose using scan matching result
                 corrected_pose = self.pose_estimator.update_from_scan_match(match_result)
                 
                 # Store the difference between odometry and corrected pose
-                odom_only_pose = self.pose_estimator.get_current_pose()
+                odom_pose = self.pose_estimator.get_current_pose()
                 self.pose_corrections.append({
-                    'odom_x': odom_only_pose.x,
-                    'odom_y': odom_only_pose.y,
-                    'odom_theta': odom_only_pose.theta,
+                    'odom_x': current_pose.x,
+                    'odom_y': current_pose.y,
+                    'odom_theta': current_pose.theta,
                     'corrected_x': corrected_pose.x,
                     'corrected_y': corrected_pose.y,
                     'corrected_theta': corrected_pose.theta,
-                    'scan_match_success': match_result.success,
-                    'fitness_score': match_result.fitness_score
+                    'confidence': confidence
                 })
+                
             except Exception as e:
                 print(f"Scan matching failed: {e}")
                 # Fall back to odometry if scan matching fails
@@ -220,28 +278,22 @@ class SLAMCoordinator:
         
         # Update the occupancy grid with the corrected pose and scan
         if self.occupancy_grid:
-            # Get covariance if available
-            pose_covariance = None
-            if hasattr(self.pose_estimator, 'current_pose_with_cov'):
-                pose_covariance = self.pose_estimator.current_pose_with_cov.covariance
+            # Convert scan to world coordinates using corrected pose
+            corrected_x_points, corrected_y_points = scan_converter.convert_scans_to_cartesian(
+                scan_ranges, 
+                self.angle_min, 
+                self.angle_max, 
+                corrected_pose_dict,
+                **self.scan_config
+            )
             
-            # Use uncertainty-aware update if it's an EnhancedOccupancyGrid
-            if hasattr(self.occupancy_grid, 'update_grid_with_uncertainty'):
-                self.occupancy_grid.update_grid_with_uncertainty(
-                    corrected_pose.x, 
-                    corrected_pose.y, 
-                    x_points, 
-                    y_points,
-                    pose_covariance
-                )
-            else:
-                # Fall back to standard update
-                self.occupancy_grid.update_grid(
-                    corrected_pose.x, 
-                    corrected_pose.y, 
-                    x_points, 
-                    y_points
-                )
+            # Update the grid
+            self.occupancy_grid.update_grid(
+                corrected_pose.x, 
+                corrected_pose.y, 
+                corrected_x_points, 
+                corrected_y_points
+            )
         
         # Store the current scan for next iteration
         self.previous_scan = parsed_data.copy()
@@ -253,13 +305,13 @@ class SLAMCoordinator:
         updated_data['pose'] = corrected_pose_dict  # Update with corrected
         
         # Add matching information if available
-        if match_result is not None:
+        if match_result:
+            matched_pose, confidence = match_result
             updated_data['scan_match_info'] = {
-                'success': match_result.success,
-                'fitness_score': match_result.fitness_score,
-                'inlier_rmse': match_result.inlier_rmse,
-                'iterations': match_result.iterations,
-                'computation_time': match_result.computation_time
+                'confidence': confidence,
+                'pose_change_x': matched_pose['x'] - initial_pose['x'],
+                'pose_change_y': matched_pose['y'] - initial_pose['y'],
+                'pose_change_theta': matched_pose['theta'] - initial_pose['theta']
             }
         
         return updated_data
@@ -287,7 +339,12 @@ class SLAMCoordinator:
             # Print progress every 10%
             if (i + 1) % max(1, len(parsed_data_list) // 10) == 0:
                 progress = (i + 1) / len(parsed_data_list) * 100
-                print(f"Progress: {progress:.1f}% ({i + 1}/{len(parsed_data_list)})")
+                elapsed = time.time() - start_time
+                estimated_total = elapsed / (i + 1) * len(parsed_data_list)
+                remaining = estimated_total - elapsed
+                
+                print(f"Progress: {progress:.1f}% ({i + 1}/{len(parsed_data_list)}) - "
+                     f"Time: {elapsed:.1f}s / Est. remaining: {remaining:.1f}s")
             
             # Process the scan
             updated_data = self.process_scan(parsed_data)
@@ -300,6 +357,22 @@ class SLAMCoordinator:
         print(f"Processing complete. Processed {len(parsed_data_list)} scans in {processing_time:.2f} seconds")
         print(f"Average processing speed: {scans_per_second:.2f} scans/second")
         
+        # Print scan matching statistics if any matches were performed
+        if self.scan_match_results:
+            confidences = [result['confidence'] for result in self.scan_match_results]
+            avg_confidence = sum(confidences) / len(confidences)
+            print(f"Average scan matching confidence: {avg_confidence:.4f}")
+            
+            if self.pose_corrections:
+                # Calculate average correction distance
+                correction_distances = [
+                    np.sqrt((corr['corrected_x'] - corr['odom_x'])**2 + 
+                            (corr['corrected_y'] - corr['odom_y'])**2)
+                    for corr in self.pose_corrections
+                ]
+                avg_correction = sum(correction_distances) / len(correction_distances)
+                print(f"Average pose correction: {avg_correction:.4f} meters")
+        
         return updated_data_list
     
     def get_occupancy_grid(self):
@@ -309,6 +382,12 @@ class SLAMCoordinator:
     def get_pose_history(self):
         """Get the history of poses from the estimator"""
         return self.pose_estimator.get_pose_history()
+    
+    def get_confidence_history(self):
+        """Get the history of scan matching confidence values"""
+        if hasattr(self.pose_estimator, 'get_confidence_history'):
+            return self.pose_estimator.get_confidence_history()
+        return [result['confidence'] for result in self.scan_match_results]
     
     def reset(self):
         """Reset the SLAM system to initial state"""
@@ -323,6 +402,10 @@ class SLAMCoordinator:
                 width=grid_width,
                 height=grid_height
             )
+            
+            # Re-initialize scan matcher
+            self.scan_matcher = None
+            self._initialize_scan_matcher()
         
         # Reset scan data
         self.previous_scan = None
@@ -332,10 +415,3 @@ class SLAMCoordinator:
         self.scan_counter = 0
         self.scan_match_results = []
         self.pose_corrections = []
-
-
-# Example usage
-if __name__ == "__main__":
-    # This will be extended to work with your existing system
-    print("SLAM Coordinator module loaded.")
-    print("Run this through main.py with appropriate modifications.")

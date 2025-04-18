@@ -1,30 +1,29 @@
 """
-Enhanced Occupancy Grid Module
+Occupancy Grid Mapping Module
 
-This module provides an enhanced occupancy grid implementation with improved
-probabilistic updates and uncertainty handling for LiDAR SLAM.
+Core implementation of the occupancy grid mapping algorithm, which can be used
+by other modules like Scan Matcher or FastSLAM. This module focuses on the mapping
+functionality without visualization dependencies.
 """
 
+import math
 import numpy as np
 import os
 import time
-import matplotlib.pyplot as plt
-import matplotlib.colors as colors
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-import math
-import pickle
+import json
 
 class OccupancyGrid:
-    """Class for maintaining an enhanced probabilistic occupancy grid map"""
+    """Class to handle occupancy grid mapping from LiDAR data"""
     
-    def __init__(self, resolution=0.05, width=20.0, height=20.0):
+    def __init__(self, resolution=0.05, width=20, height=20, init_position=None):
         """
-        Initialize an occupancy grid with given parameters
+        Initialize an occupancy grid
         
         Args:
-            resolution (float): Grid resolution in meters per cell
+            resolution (float): Grid cell size in meters
             width (float): Width of the grid in meters
             height (float): Height of the grid in meters
+            init_position (dict): Optional initial position with 'x', 'y', 'theta' keys
         """
         self.resolution = resolution
         self.width = width
@@ -34,66 +33,71 @@ class OccupancyGrid:
         self.grid_width = int(width / resolution)
         self.grid_height = int(height / resolution)
         
-        # Ensure grid dimensions are odd for easy centering
-        if self.grid_width % 2 == 0:
-            self.grid_width += 1
-        if self.grid_height % 2 == 0:
-            self.grid_height += 1
-        
-        # Update actual width and height
-        self.width = self.grid_width * resolution
-        self.height = self.grid_height * resolution
-        
-        # Create the grid with initial probabilities
-        # 0.5 represents unknown (log-odds = 0)
+        # Initialize grid with unknown values (0.5 represents unknown)
+        # Values closer to 1 will represent occupied
+        # Values closer to 0 will represent free
         self.grid = np.ones((self.grid_height, self.grid_width)) * 0.5
         
-        # For log-odds representation
+        # Origin of the grid (center of the grid)
+        self.origin_x = width / 2
+        self.origin_y = height / 2
+        
+        # Log odds version of the grid (for Bayesian updates)
+        # Initialize with log odds of 0.5 probability -> log(0.5/0.5) = 0
         self.log_odds_grid = np.zeros((self.grid_height, self.grid_width))
         
-        # Sensor model parameters
-        self.p_hit = 0.7      # Probability of hit if occupied
-        self.p_miss = 0.3     # Probability of miss if occupied
-        self.p_occ_prior = 0.5  # Prior probability of occupancy
+        # Parameters for occupancy update
+        self.log_odds_occupied = math.log(0.7/0.3)  # Probability of cell being occupied given a hit
+        self.log_odds_free = math.log(0.3/0.7)      # Probability of cell being occupied given a miss
         
-        # Log-odds versions
-        self.log_odds_hit = np.log(self.p_hit / (1 - self.p_hit))
-        self.log_odds_miss = np.log(self.p_miss / (1 - self.p_miss))
-        self.log_odds_prior = np.log(self.p_occ_prior / (1 - self.p_occ_prior))
+        # Additional parameters for scan matching
+        self.lidar_max_range = 10.0  # Default LiDAR range in meters
+        self.lidar_fov = math.pi     # Default LiDAR field of view in radians
+        self.num_samples_per_rev = 180  # Default number of samples per revolution
+        self.angular_step = math.pi / 180  # Default angular step (1 degree)
         
-        # Clamping thresholds for log-odds values
-        self.log_odds_min = -10.0  # Minimum log-odds value
-        self.log_odds_max = 10.0   # Maximum log-odds value
+        # Keep track of visits for each cell (for scan matching)
+        self.occupancy_grid_visited = np.zeros((self.grid_height, self.grid_width))
+        self.occupancy_grid_total = np.ones((self.grid_height, self.grid_width))
         
-        # Metadata
+        # Create coordinate matrices for the grid (useful for scan matching)
+        self.OccupancyGridX, self.OccupancyGridY = np.meshgrid(
+            np.linspace(-width/2, width/2, self.grid_width),
+            np.linspace(-height/2, height/2, self.grid_height)
+        )
+        
+        # Optional: Store metadata about the mapping
         self.metadata = {
-            'creation_time': time.time(),
             'resolution': resolution,
             'width': width,
             'height': height,
-            'grid_width': self.grid_width,
-            'grid_height': self.grid_height,
             'updates': 0,
-            'sensor_model': {
-                'p_hit': self.p_hit,
-                'p_miss': self.p_miss,
-                'p_occ_prior': self.p_occ_prior
-            }
+            'creation_time': time.time()
         }
+        
+        # Store initial position if provided
+        if init_position:
+            self.metadata['init_x'] = init_position['x']
+            self.metadata['init_y'] = init_position['y']
+            self.metadata['init_theta'] = init_position['theta']
     
     def world_to_grid(self, x, y):
         """
         Convert world coordinates to grid indices
         
         Args:
-            x (float): X coordinate in world frame (meters)
-            y (float): Y coordinate in world frame (meters)
+            x (float): X coordinate in world frame
+            y (float): Y coordinate in world frame
             
         Returns:
-            tuple: (grid_x, grid_y) indices in the grid
+            tuple: (grid_x, grid_y) indices
         """
-        grid_x = int((x + self.width / 2) / self.resolution)
-        grid_y = int((y + self.height / 2) / self.resolution)
+        grid_x = int((x + self.origin_x) / self.resolution)
+        grid_y = int((y + self.origin_y) / self.resolution)
+        
+        # Ensure we're within grid bounds
+        grid_x = max(0, min(grid_x, self.grid_width - 1))
+        grid_y = max(0, min(grid_y, self.grid_height - 1))
         
         return grid_x, grid_y
     
@@ -102,101 +106,62 @@ class OccupancyGrid:
         Convert grid indices to world coordinates
         
         Args:
-            grid_x (int): X index in the grid
-            grid_y (int): Y index in the grid
+            grid_x (int): X index in grid
+            grid_y (int): Y index in grid
             
         Returns:
-            tuple: (x, y) coordinates in world frame (meters)
+            tuple: (x, y) coordinates in world frame
         """
-        x = grid_x * self.resolution - self.width / 2
-        y = grid_y * self.resolution - self.height / 2
-        
+        x = grid_x * self.resolution - self.origin_x
+        y = grid_y * self.resolution - self.origin_y
         return x, y
     
-    def is_inside_grid(self, grid_x, grid_y):
+    def update_grid(self, robot_x, robot_y, scan_x, scan_y):
         """
-        Check if the given grid indices are within the grid bounds
+        Update the occupancy grid with a laser scan
         
         Args:
-            grid_x (int): X index in the grid
-            grid_y (int): Y index in the grid
-            
-        Returns:
-            bool: True if inside grid, False otherwise
+            robot_x (float): Robot's x position in world coordinates
+            robot_y (float): Robot's y position in world coordinates
+            scan_x (list): List of scan x points in world coordinates
+            scan_y (list): List of scan y points in world coordinates
         """
-        return (0 <= grid_x < self.grid_width and 0 <= grid_y < self.grid_height)
-    
-    def get_grid(self):
-        """
-        Get the current probability grid
-        
-        Returns:
-            np.ndarray: The occupancy grid with probabilities
-        """
-        return self.grid.copy()
-    
-    def get_binary_grid(self, threshold=0.5):
-        """
-        Get a binary version of the grid (occupied/free)
-        
-        Args:
-            threshold (float): Probability threshold for considering a cell occupied
-            
-        Returns:
-            np.ndarray: Binary grid (1 for occupied, 0 for free)
-        """
-        return (self.grid > threshold).astype(np.int8)
-    
-    def get_metadata(self):
-        """
-        Get grid metadata
-        
-        Returns:
-            dict: Grid metadata
-        """
-        return self.metadata.copy()
-    
-    def update_grid(self, robot_x, robot_y, scan_x, scan_y, uncertainty=None):
-        """
-        Update the occupancy grid with a new scan
-        
-        Args:
-            robot_x (float): Robot X position in world frame
-            robot_y (float): Robot Y position in world frame
-            scan_x (list): List of X coordinates of scan points in world frame
-            scan_y (list): List of Y coordinates of scan points in world frame
-            uncertainty (tuple): Optional (x_var, y_var, theta_var) pose uncertainty
-        """
-        if len(scan_x) != len(scan_y) or len(scan_x) == 0:
-            return
-        
         # Convert robot position to grid coordinates
         robot_grid_x, robot_grid_y = self.world_to_grid(robot_x, robot_y)
         
-        # Check if robot is inside grid
-        if not self.is_inside_grid(robot_grid_x, robot_grid_y):
-            print(f"Warning: Robot at ({robot_x:.2f}, {robot_y:.2f}) is outside grid boundaries.")
-            return
+        # Mark cells with scan points as occupied
+        for x, y in zip(scan_x, scan_y):
+            # Check if the point is within the grid boundaries
+            if (abs(x) < self.width/2 and abs(y) < self.height/2):
+                # Convert scan point to grid coordinates
+                grid_x, grid_y = self.world_to_grid(x, y)
+                
+                # Mark the cell as occupied (update log odds)
+                self.log_odds_grid[grid_y, grid_x] += self.log_odds_occupied
+                
+                # Also update visit counts for scan matching
+                self.occupancy_grid_visited[grid_y, grid_x] += 1
+                self.occupancy_grid_total[grid_y, grid_x] += 1
+                
+                # Use bresenham's line algorithm to identify free cells along the ray
+                self.update_cells_along_ray(robot_grid_x, robot_grid_y, grid_x, grid_y)
         
-        # Process scan rays using Bresenham's line algorithm
-        for i in range(len(scan_x)):
-            # Convert scan point to grid coordinates
-            scan_grid_x, scan_grid_y = self.world_to_grid(scan_x[i], scan_y[i])
-            
-            # Update cells along the ray
-            self._update_ray(robot_grid_x, robot_grid_y, scan_grid_x, scan_grid_y, uncertainty)
+        # Convert log odds back to probabilities
+        self.grid = 1 - (1 / (1 + np.exp(self.log_odds_grid)))
         
-        # Increment update counter
+        # Update metadata
         self.metadata['updates'] += 1
+        self.metadata['last_update_time'] = time.time()
     
-    def _update_ray(self, x0, y0, x1, y1, uncertainty=None):
+    def update_cells_along_ray(self, x0, y0, x1, y1):
         """
-        Update cells along a ray using Bresenham's line algorithm
+        Mark cells along a ray from (x0,y0) to (x1,y1) as free using Bresenham's algorithm
         
         Args:
-            x0, y0 (int): Start point (robot) in grid coordinates
-            x1, y1 (int): End point (scan) in grid coordinates
-            uncertainty (tuple): Optional (x_var, y_var, theta_var) pose uncertainty
+            x0 (int): Starting x grid coordinate
+            y0 (int): Starting y grid coordinate
+            x1 (int): Ending x grid coordinate
+            y1 (int): Ending y grid coordinate
         """
         # Bresenham's line algorithm
         dx = abs(x1 - x0)
@@ -205,317 +170,512 @@ class OccupancyGrid:
         sy = 1 if y0 < y1 else -1
         err = dx - dy
         
-        x, y = x0, y0
-        
-        # Variables to track the ray
-        cells_visited = []
-        hit_endpoint = False
-        
-        # Apply uncertainty adjustment if provided
-        uncertainty_factor = 1.0
-        if uncertainty is not None:
-            x_var, y_var, theta_var = uncertainty
-            # Calculate distance from robot to scan point
-            distance = math.sqrt((x1 - x0)**2 + (y1 - y0)**2) * self.resolution
+        while x0 != x1 or y0 != y1:
+            # Mark the current cell as free (except the endpoint)
+            if x0 != x1 or y0 != y1:  # Don't update the endpoint
+                # Ensure we're within grid bounds
+                if 0 <= x0 < self.grid_width and 0 <= y0 < self.grid_height:
+                    self.log_odds_grid[y0, x0] += self.log_odds_free
+                    
+                    # Also update visit counts for scan matching
+                    self.occupancy_grid_total[y0, x0] += 1
             
-            # Higher uncertainty at longer distances
-            angle_uncertainty = math.atan2(math.sqrt(x_var + y_var), distance)
-            uncertainty_factor = max(0.1, 1.0 - min(0.9, angle_uncertainty + theta_var))
-        
-        while True:
-            # Check if we're inside the grid
-            if not self.is_inside_grid(x, y):
-                break
-            
-            # Add current cell to visited cells
-            cells_visited.append((x, y))
-            
-            # Check if we've reached the endpoint
-            if x == x1 and y == y1:
-                hit_endpoint = True
-                break
-            
-            # Bresenham's line algorithm step
             e2 = 2 * err
             if e2 > -dy:
                 err -= dy
-                x += sx
+                x0 += sx
             if e2 < dx:
                 err += dx
-                y += sy
-        
-        # Now update the cells
-        for i, (cell_x, cell_y) in enumerate(cells_visited):
-            if self.is_inside_grid(cell_x, cell_y):
-                if hit_endpoint and i == len(cells_visited) - 1:
-                    # Last cell and we hit the endpoint - it's an obstacle
-                    # Apply uncertainty-adjusted hit update
-                    log_odds_update = self.log_odds_hit * uncertainty_factor
-                    self.log_odds_grid[cell_y, cell_x] = min(
-                        self.log_odds_max, 
-                        self.log_odds_grid[cell_y, cell_x] + log_odds_update
-                    )
-                else:
-                    # Cell along the ray - it's free space
-                    # Apply uncertainty-adjusted miss update
-                    log_odds_update = self.log_odds_miss * uncertainty_factor
-                    self.log_odds_grid[cell_y, cell_x] = max(
-                        self.log_odds_min, 
-                        self.log_odds_grid[cell_y, cell_x] + log_odds_update
-                    )
-        
-        # Convert log-odds back to probabilities
-        self.grid = 1 - (1 / (1 + np.exp(self.log_odds_grid)))
+                y0 += sy
+            
+            # Stop if we reach the endpoint or one cell before it
+            if (x0 == x1 and y0 == y1) or \
+               (x0 + sx == x1 and y0 == y1) or \
+               (x0 == x1 and y0 + sy == y1):
+                break
     
-    def update_grid_with_uncertainty(self, robot_x, robot_y, scan_x, scan_y, pose_covariance):
+    def get_grid(self):
         """
-        Update the occupancy grid with a new scan, considering pose uncertainty
+        Get a copy of the grid
+        
+        Returns:
+            numpy.ndarray: Copy of the occupancy grid
+        """
+        return self.grid.copy()
+    
+    def get_metadata(self):
+        """
+        Get grid metadata
+        
+        Returns:
+            dict: Dictionary with grid metadata
+        """
+        return self.metadata.copy()
+    
+    def set_lidar_params(self, max_range, field_of_view, num_samples):
+        """
+        Set LiDAR parameters for scan matching
         
         Args:
-            robot_x (float): Robot X position in world frame
-            robot_y (float): Robot Y position in world frame
-            scan_x (list): List of X coordinates of scan points in world frame
-            scan_y (list): List of Y coordinates of scan points in world frame
-            pose_covariance (np.ndarray): 3x3 pose covariance matrix (x, y, theta)
+            max_range (float): Maximum range of the LiDAR in meters
+            field_of_view (float): Field of view in radians
+            num_samples (int): Number of samples per revolution
         """
-        if pose_covariance is None:
-            # Fall back to standard update if no covariance provided
-            self.update_grid(robot_x, robot_y, scan_x, scan_y)
-            return
-        
-        # Extract variances from covariance matrix
-        x_var = pose_covariance[0, 0]
-        y_var = pose_covariance[1, 1]
-        theta_var = pose_covariance[2, 2]
-        
-        # Update with uncertainty information
-        self.update_grid(robot_x, robot_y, scan_x, scan_y, (x_var, y_var, theta_var))
+        self.lidar_max_range = max_range
+        self.lidar_fov = field_of_view
+        self.num_samples_per_rev = num_samples
+        self.angular_step = field_of_view / num_samples
     
-    def mark_cell(self, x, y, occupied=True, log_odds_value=None):
+    def checkAndExapndOG(self, x_range, y_range):
         """
-        Explicitly mark a cell as occupied or free
+        Check if the specified range is covered by the occupancy grid and expand if needed
+        
+        Args:
+            x_range (list): [min_x, max_x] in world coordinates
+            y_range (list): [min_y, max_y] in world coordinates
+        """
+        # Check if we need to expand the grid
+        need_expansion = False
+        new_width = self.width
+        new_height = self.height
+        
+        # Check if x_range is outside the current grid
+        if x_range[0] < -self.width/2:
+            expand_left = abs(x_range[0]) - self.width/2
+            new_width += expand_left
+            need_expansion = True
+            
+        if x_range[1] > self.width/2:
+            expand_right = x_range[1] - self.width/2
+            new_width += expand_right
+            need_expansion = True
+            
+        # Check if y_range is outside the current grid
+        if y_range[0] < -self.height/2:
+            expand_bottom = abs(y_range[0]) - self.height/2
+            new_height += expand_bottom
+            need_expansion = True
+            
+        if y_range[1] > self.height/2:
+            expand_top = y_range[1] - self.height/2
+            new_height += expand_top
+            need_expansion = True
+        
+        # Expand grid if needed
+        if need_expansion:
+            self.resize_grid(new_width, new_height)
+    
+    def convertRealXYToMapIdx(self, x_range, y_range):
+        """
+        Convert world coordinate ranges to grid indices
+        
+        Args:
+            x_range (list): [min_x, max_x] in world coordinates
+            y_range (list): [min_y, max_y] in world coordinates
+            
+        Returns:
+            tuple: (x_indices, y_indices) corresponding to the x and y ranges
+        """
+        x_idx = [
+            max(0, min(self.grid_width - 1, int((x + self.origin_x) / self.resolution)))
+            for x in x_range
+        ]
+        
+        y_idx = [
+            max(0, min(self.grid_height - 1, int((y + self.origin_y) / self.resolution)))
+            for y in y_range
+        ]
+        
+        return x_idx, y_idx
+    
+    def resize_grid(self, new_width, new_height):
+        """
+        Resize the grid to new dimensions, preserving existing data
+        
+        Args:
+            new_width (float): New width in meters
+            new_height (float): New height in meters
+        """
+        # Calculate new grid dimensions
+        new_grid_width = int(new_width / self.resolution)
+        new_grid_height = int(new_height / self.resolution)
+        
+        # Create new grids with unknown values
+        new_grid = np.ones((new_grid_height, new_grid_width)) * 0.5
+        new_log_odds_grid = np.zeros((new_grid_height, new_grid_width))
+        new_visited = np.zeros((new_grid_height, new_grid_width))
+        new_total = np.ones((new_grid_height, new_grid_width))
+        
+        # Calculate offsets to center the old grid in the new one
+        old_center_x = self.grid_width // 2
+        old_center_y = self.grid_height // 2
+        new_center_x = new_grid_width // 2
+        new_center_y = new_grid_height // 2
+        
+        offset_x = new_center_x - old_center_x
+        offset_y = new_center_y - old_center_y
+        
+        # Copy old grid data to new grid
+        for y in range(self.grid_height):
+            for x in range(self.grid_width):
+                new_x = x + offset_x
+                new_y = y + offset_y
+                
+                if 0 <= new_x < new_grid_width and 0 <= new_y < new_grid_height:
+                    new_grid[new_y, new_x] = self.grid[y, x]
+                    new_log_odds_grid[new_y, new_x] = self.log_odds_grid[y, x]
+                    new_visited[new_y, new_x] = self.occupancy_grid_visited[y, x]
+                    new_total[new_y, new_x] = self.occupancy_grid_total[y, x]
+        
+        # Update grid properties
+        self.width = new_width
+        self.height = new_height
+        self.grid_width = new_grid_width
+        self.grid_height = new_grid_height
+        self.grid = new_grid
+        self.log_odds_grid = new_log_odds_grid
+        self.occupancy_grid_visited = new_visited
+        self.occupancy_grid_total = new_total
+        self.origin_x = new_width / 2
+        self.origin_y = new_height / 2
+        
+        # Regenerate coordinate matrices
+        self.OccupancyGridX, self.OccupancyGridY = np.meshgrid(
+            np.linspace(-new_width/2, new_width/2, new_grid_width),
+            np.linspace(-new_height/2, new_height/2, new_grid_height)
+        )
+        
+        # Update metadata
+        self.metadata['width'] = new_width
+        self.metadata['height'] = new_height
+        self.metadata['grid_width'] = new_grid_width
+        self.metadata['grid_height'] = new_grid_height
+    
+    def save_to_file(self, filename, format='npy', include_metadata=True):
+        """
+        Save the occupancy grid to a file (without visualization dependencies)
+        
+        Args:
+            filename (str): Base filename without extension
+            format (str): File format ('npy', 'csv', 'all', or 'png')
+            include_metadata (bool): Whether to save metadata
+            
+        Returns:
+            list: List of saved filenames
+        """
+        saved_files = []
+        
+        # Create a timestamped filename if none provided
+        if not filename:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"occupancy_grid_{timestamp}"
+        
+        # Make sure the directory exists
+        directory = os.path.dirname(filename)
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory)
+                print(f"Created directory: {directory}")
+            except Exception as e:
+                print(f"Error creating directory {directory}: {e}")
+                return saved_files
+        
+        # Save as NumPy array (NPY)
+        if format.lower() == 'npy' or format.lower() == 'all':
+            npy_filename = f"{filename}.npy"
+            try:
+                # Save the grid data
+                np.save(npy_filename, self.grid)
+                
+                # Save log odds grid as well
+                log_odds_filename = f"{filename}_log_odds.npy"
+                np.save(log_odds_filename, self.log_odds_grid)
+                saved_files.append(log_odds_filename)
+                
+                # Save visited and total counts
+                visited_filename = f"{filename}_visited.npy"
+                total_filename = f"{filename}_total.npy"
+                np.save(visited_filename, self.occupancy_grid_visited)
+                np.save(total_filename, self.occupancy_grid_total)
+                saved_files.append(visited_filename)
+                saved_files.append(total_filename)
+                
+                # If metadata requested, save it as a separate JSON file
+                if include_metadata:
+                    metadata_filename = f"{filename}_metadata.json"
+                    
+                    with open(metadata_filename, 'w') as f:
+                        json.dump(self.metadata, f, indent=4)
+                    
+                    print(f"Saved grid metadata: {metadata_filename}")
+                    saved_files.append(metadata_filename)
+                
+                print(f"Saved grid as NumPy array: {npy_filename}")
+                saved_files.append(npy_filename)
+            except Exception as e:
+                print(f"Error saving grid as NumPy array: {e}")
+        
+        # Save as CSV
+        if format.lower() == 'csv' or format.lower() == 'all':
+            csv_filename = f"{filename}.csv"
+            try:
+                # Save the grid data as CSV
+                np.savetxt(csv_filename, self.grid, delimiter=',')
+                
+                # Save log odds grid as well
+                log_odds_csv = f"{filename}_log_odds.csv"
+                np.savetxt(log_odds_csv, self.log_odds_grid, delimiter=',')
+                saved_files.append(log_odds_csv)
+                
+                # If metadata requested, save it as a separate CSV file
+                if include_metadata:
+                    metadata_csv_filename = f"{filename}_metadata.csv"
+                    with open(metadata_csv_filename, 'w') as f:
+                        for key, value in self.metadata.items():
+                            f.write(f"{key},{value}\n")
+                    
+                    print(f"Saved grid metadata as CSV: {metadata_csv_filename}")
+                    saved_files.append(metadata_csv_filename)
+                
+                print(f"Saved grid as CSV: {csv_filename}")
+                saved_files.append(csv_filename)
+            except Exception as e:
+                print(f"Error saving grid as CSV: {e}")
+        
+        # For PNG format, we'll import visualization-specific dependencies only if needed
+        if format.lower() == 'png' or format.lower() == 'all':
+            try:
+                # Import here to avoid circular import and dependency on visualization
+                from lidar_slam.utils import file_utils
+                
+                # If robot path is in metadata, extract it
+                robot_path = None
+                start_pos = None
+                current_pos = None
+                
+                if 'robot_path' in self.metadata:
+                    robot_path = self.metadata['robot_path']
+                    if robot_path:
+                        start_pos = robot_path[0]
+                        current_pos = robot_path[-1]
+                
+                # Save as image using the utility function
+                img_file = file_utils.save_grid_as_image(
+                    self.grid,
+                    filename,
+                    resolution=self.resolution,
+                    width=self.width,
+                    height=self.height,
+                    robot_path=robot_path,
+                    start_position=start_pos,
+                    current_position=current_pos
+                )
+                
+                if img_file:
+                    saved_files.append(img_file)
+            except ImportError:
+                print("Warning: Visualization dependencies not available. Cannot save as PNG.")
+            except Exception as e:
+                print(f"Error saving grid as PNG: {e}")
+        
+        return saved_files
+
+    def load_from_file(self, filename, format='npy', load_metadata=True):
+        """
+        Load the occupancy grid from a file
+        
+        Args:
+            filename (str): Filename without extension if format is specified
+            format (str): File format ('npy' or 'csv')
+            load_metadata (bool): Whether to load metadata if available
+            
+        Returns:
+            bool: Success or failure
+        """
+        try:
+            # Load grid data
+            if format.lower() == 'npy':
+                npy_filename = f"{filename}.npy"
+                self.grid = np.load(npy_filename)
+                
+                # Try to load log odds grid
+                try:
+                    log_odds_filename = f"{filename}_log_odds.npy"
+                    self.log_odds_grid = np.load(log_odds_filename)
+                    
+                    # Try to load visited and total counts
+                    try:
+                        visited_filename = f"{filename}_visited.npy"
+                        total_filename = f"{filename}_total.npy"
+                        self.occupancy_grid_visited = np.load(visited_filename)
+                        self.occupancy_grid_total = np.load(total_filename)
+                    except:
+                        print("Warning: Could not load visit counts, initializing to defaults")
+                        self.occupancy_grid_visited = np.zeros_like(self.grid)
+                        self.occupancy_grid_total = np.ones_like(self.grid)
+                except:
+                    print("Warning: Could not load log odds grid, reconstructing from probabilities")
+                    # Reconstruct log odds grid from probability grid
+                    epsilon = 1e-10  # Small constant to avoid log(0) or log(1)
+                    prob_grid = np.clip(self.grid, epsilon, 1 - epsilon)
+                    self.log_odds_grid = np.log(prob_grid / (1 - prob_grid))
+            elif format.lower() == 'csv':
+                csv_filename = f"{filename}.csv"
+                self.grid = np.loadtxt(csv_filename, delimiter=',')
+                
+                # Try to load log odds grid
+                try:
+                    log_odds_csv = f"{filename}_log_odds.csv"
+                    self.log_odds_grid = np.loadtxt(log_odds_csv, delimiter=',')
+                except:
+                    print("Warning: Could not load log odds grid, reconstructing from probabilities")
+                    # Reconstruct log odds grid from probability grid
+                    epsilon = 1e-10  # Small constant to avoid log(0) or log(1)
+                    prob_grid = np.clip(self.grid, epsilon, 1 - epsilon)
+                    self.log_odds_grid = np.log(prob_grid / (1 - prob_grid))
+                    
+                # Initialize visited and total counts
+                self.occupancy_grid_visited = np.zeros_like(self.grid)
+                self.occupancy_grid_total = np.ones_like(self.grid)
+            else:
+                print(f"Unsupported format: {format}")
+                return False
+            
+            # Update grid dimensions from loaded data
+            self.grid_height, self.grid_width = self.grid.shape
+            
+            # Load metadata if requested
+            if load_metadata:
+                metadata_loaded = False
+                
+                # Try JSON format first
+                metadata_json = f"{filename}_metadata.json"
+                if os.path.exists(metadata_json):
+                    try:
+                        with open(metadata_json, 'r') as f:
+                            loaded_metadata = json.load(f)
+                        self.metadata.update(loaded_metadata)
+                        
+                        # Update grid properties from metadata
+                        if 'resolution' in loaded_metadata:
+                            self.resolution = loaded_metadata['resolution']
+                        if 'width' in loaded_metadata:
+                            self.width = loaded_metadata['width']
+                        if 'height' in loaded_metadata:
+                            self.height = loaded_metadata['height']
+                        
+                        # Recalculate derived properties
+                        self.origin_x = self.width / 2
+                        self.origin_y = self.height / 2
+                        
+                        # Recreate coordinate matrices
+                        self.OccupancyGridX, self.OccupancyGridY = np.meshgrid(
+                            np.linspace(-self.width/2, self.width/2, self.grid_width),
+                            np.linspace(-self.height/2, self.height/2, self.grid_height)
+                        )
+                        
+                        metadata_loaded = True
+                    except Exception as e:
+                        print(f"Error loading metadata from JSON: {e}")
+                
+                # Try CSV format if JSON failed
+                if not metadata_loaded:
+                    metadata_csv = f"{filename}_metadata.csv"
+                    if os.path.exists(metadata_csv):
+                        try:
+                            with open(metadata_csv, 'r') as f:
+                                for line in f:
+                                    key, value = line.strip().split(',', 1)
+                                    try:
+                                        # Convert numeric values
+                                        self.metadata[key] = float(value)
+                                    except ValueError:
+                                        self.metadata[key] = value
+                            
+                            # Update grid properties from metadata
+                            if 'resolution' in self.metadata:
+                                self.resolution = self.metadata['resolution']
+                            if 'width' in self.metadata:
+                                self.width = self.metadata['width']
+                            if 'height' in self.metadata:
+                                self.height = self.metadata['height']
+                            
+                            # Recalculate derived properties
+                            self.origin_x = self.width / 2
+                            self.origin_y = self.height / 2
+                            
+                            # Recreate coordinate matrices
+                            self.OccupancyGridX, self.OccupancyGridY = np.meshgrid(
+                                np.linspace(-self.width/2, self.width/2, self.grid_width),
+                                np.linspace(-self.height/2, self.height/2, self.grid_height)
+                            )
+                        except Exception as e:
+                            print(f"Error loading metadata from CSV: {e}")
+            
+            print(f"Successfully loaded grid from {filename}.{format}")
+            return True
+        
+        except Exception as e:
+            print(f"Error loading grid from file: {e}")
+            return False
+    
+    def get_scan_match_info(self):
+        """
+        Get information needed for scan matching
+        
+        Returns:
+            dict: Dictionary with scan matching related information
+        """
+        return {
+            'resolution': self.resolution,
+            'width': self.width,
+            'height': self.height,
+            'grid_width': self.grid_width,
+            'grid_height': self.grid_height,
+            'lidar_max_range': self.lidar_max_range,
+            'lidar_fov': self.lidar_fov,
+            'num_samples_per_rev': self.num_samples_per_rev,
+            'angular_step': self.angular_step
+        }
+    
+    def get_occupancy_probability(self, x, y):
+        """
+        Get the occupancy probability at a specific world coordinate
         
         Args:
             x (float): X coordinate in world frame
             y (float): Y coordinate in world frame
-            occupied (bool): True to mark as occupied, False to mark as free
-            log_odds_value (float): Optional explicit log-odds value to set
-        """
-        grid_x, grid_y = self.world_to_grid(x, y)
-        
-        if not self.is_inside_grid(grid_x, grid_y):
-            return
-        
-        if log_odds_value is not None:
-            # Set explicit log-odds value
-            self.log_odds_grid[grid_y, grid_x] = np.clip(
-                log_odds_value, self.log_odds_min, self.log_odds_max
-            )
-        else:
-            # Set occupied or free
-            self.log_odds_grid[grid_y, grid_x] = (
-                self.log_odds_max if occupied else self.log_odds_min
-            )
-        
-        # Update probability
-        self.grid[grid_y, grid_x] = 1 - (1 / (1 + np.exp(self.log_odds_grid[grid_y, grid_x])))
-    
-    def reset_grid(self):
-        """Reset the grid to initial unknown state"""
-        self.grid = np.ones((self.grid_height, self.grid_width)) * 0.5
-        self.log_odds_grid = np.zeros((self.grid_height, self.grid_width))
-        
-        # Reset update counter
-        self.metadata['updates'] = 0
-    
-    def save_to_file(self, filename, format='all', include_metadata=True):
-        """
-        Save the occupancy grid to file(s)
-        
-        Args:
-            filename (str): Base filename without extension
-            format (str): Format to save ('png', 'npy', 'csv', 'pickle', or 'all')
-            include_metadata (bool): Whether to include metadata in saved files
-        """
-        # Save as NumPy array
-        if format in ['npy', 'all']:
-            np.save(f"{filename}.npy", self.grid)
-            
-            if include_metadata:
-                # Save metadata separately
-                metadata_filename = f"{filename}_metadata.pkl"
-                with open(metadata_filename, 'wb') as f:
-                    pickle.dump(self.metadata, f)
-        
-        # Save as CSV
-        if format in ['csv', 'all']:
-            np.savetxt(f"{filename}.csv", self.grid, delimiter=',')
-            
-            if include_metadata:
-                # Save metadata as JSON
-                import json
-                metadata_filename = f"{filename}_metadata.json"
-                with open(metadata_filename, 'w') as f:
-                    json.dump(self.metadata, f, indent=2)
-        
-        # Save as pickle (complete object)
-        if format in ['pickle', 'all']:
-            with open(f"{filename}.pkl", 'wb') as f:
-                pickle.dump(self, f)
-        
-        # Save as PNG image
-        if format in ['png', 'all']:
-            self.save_as_image(f"{filename}.png", include_metadata)
-    
-    def save_as_image(self, filename, include_metadata=True):
-        """
-        Save the occupancy grid as an image
-        
-        Args:
-            filename (str): Filename to save the image
-            include_metadata (bool): Whether to include metadata in the image
-        """
-        # Create a figure with a specific size
-        fig = plt.figure(figsize=(10, 10), dpi=100)
-        ax = fig.add_subplot(111)
-        
-        # Custom colormap for occupancy grid
-        cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
-        bounds = [0, 0.4, 0.6, 1]
-        norm = colors.BoundaryNorm(bounds, cmap.N)
-        
-        # Plot the grid
-        img = ax.imshow(
-            self.grid, 
-            cmap=cmap, 
-            norm=norm, 
-            interpolation='nearest',
-            extent=[-self.width/2, self.width/2, -self.height/2, self.height/2]
-        )
-        
-        # Add colorbar
-        cbar = fig.colorbar(img, ax=ax, ticks=[0.2, 0.5, 0.8])
-        cbar.ax.set_yticklabels(['Free', 'Unknown', 'Occupied'])
-        
-        # Add grid lines
-        ax.grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
-        
-        # Set labels and title
-        ax.set_xlabel('X (meters)')
-        ax.set_ylabel('Y (meters)')
-        ax.set_title('Occupancy Grid Map')
-        
-        # Add metadata text if requested
-        if include_metadata:
-            metadata_str = (
-                f"Resolution: {self.resolution:.3f}m/cell\n"
-                f"Dimensions: {self.width:.1f}m × {self.height:.1f}m\n"
-                f"Grid Size: {self.grid_width}×{self.grid_height} cells\n"
-                f"Updates: {self.metadata['updates']}"
-            )
-            ax.text(
-                0.02, 0.02, metadata_str,
-                transform=ax.transAxes,
-                bbox=dict(facecolor='white', alpha=0.8),
-                va='bottom'
-            )
-        
-        # Save the figure
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.close(fig)
-    
-    @staticmethod
-    def load_from_file(filename):
-        """
-        Load an occupancy grid from file
-        
-        Args:
-            filename (str): Filename to load from
             
         Returns:
-            OccupancyGrid: Loaded occupancy grid
+            float: Occupancy probability (0 to 1)
         """
-        # Check file extension
-        extension = os.path.splitext(filename)[1].lower()
+        grid_x, grid_y = self.world_to_grid(x, y)
+        return self.grid[grid_y, grid_x]
+    
+    def is_occupied(self, x, y, threshold=0.55):
+        """
+        Check if a cell is occupied
         
-        if extension == '.pkl':
-            # Load from pickle
-            with open(filename, 'rb') as f:
-                return pickle.load(f)
-        elif extension == '.npy':
-            # Load grid from NumPy and metadata from pickle if available
-            grid = np.load(filename)
+        Args:
+            x (float): X coordinate in world frame
+            y (float): Y coordinate in world frame
+            threshold (float): Occupancy threshold (default 0.55)
             
-            # Try to load metadata
-            metadata_filename = filename.replace('.npy', '_metadata.pkl')
-            metadata = None
-            if os.path.exists(metadata_filename):
-                try:
-                    with open(metadata_filename, 'rb') as f:
-                        metadata = pickle.load(f)
-                except:
-                    metadata = None
+        Returns:
+            bool: True if occupied, False otherwise
+        """
+        return self.get_occupancy_probability(x, y) > threshold
+    
+    def is_free(self, x, y, threshold=0.45):
+        """
+        Check if a cell is free
+        
+        Args:
+            x (float): X coordinate in world frame
+            y (float): Y coordinate in world frame
+            threshold (float): Free space threshold (default 0.45)
             
-            # Create new grid with loaded data
-            if metadata:
-                # Create with original parameters
-                grid_obj = OccupancyGrid(
-                    resolution=metadata['resolution'],
-                    width=metadata['width'],
-                    height=metadata['height']
-                )
-                
-                # Replace grid and metadata
-                grid_obj.grid = grid
-                grid_obj.log_odds_grid = np.log(grid / (1 - grid + 1e-10))  # Avoid div by zero
-                grid_obj.metadata = metadata
-            else:
-                # Create with default parameters
-                grid_obj = OccupancyGrid()
-                
-                # Replace grid
-                grid_height, grid_width = grid.shape
-                if grid_height == grid_obj.grid_height and grid_width == grid_obj.grid_width:
-                    grid_obj.grid = grid
-                    grid_obj.log_odds_grid = np.log(grid / (1 - grid + 1e-10))
-                else:
-                    print(f"Warning: Grid dimensions mismatch. Resizing loaded grid.")
-                    # Resize grid to match
-                    from scipy.ndimage import zoom
-                    zoom_x = grid_obj.grid_width / grid_width
-                    zoom_y = grid_obj.grid_height / grid_height
-                    grid_obj.grid = zoom(grid, (zoom_y, zoom_x), order=0)
-                    grid_obj.log_odds_grid = np.log(grid_obj.grid / (1 - grid_obj.grid + 1e-10))
-            
-            return grid_obj
-        else:
-            raise ValueError(f"Unsupported file format: {extension}")
-
-
-# Example usage
-if __name__ == "__main__":
-    # Create a test grid
-    grid = OccupancyGrid(resolution=0.1, width=10.0, height=10.0)
-    
-    # Add some obstacles
-    for x in range(-4, 5):
-        grid.mark_cell(x, -4, occupied=True)
-        grid.mark_cell(x, 4, occupied=True)
-    
-    for y in range(-4, 5):
-        grid.mark_cell(-4, y, occupied=True)
-        grid.mark_cell(4, y, occupied=True)
-    
-    # Add a simulated scan
-    robot_x, robot_y = 0, 0
-    scan_x = [3, 3, 3, 3, 3]
-    scan_y = [-3, -1.5, 0, 1.5, 3]
-    
-    # Update grid with scan
-    grid.update_grid(robot_x, robot_y, scan_x, scan_y)
-    
-    # Save to file
-    grid.save_to_file("test_grid", format='all')
-    
-    print("Test grid saved to test_grid.*")
+        Returns:
+            bool: True if free, False otherwise
+        """
+        return self.get_occupancy_probability(x, y) < threshold
