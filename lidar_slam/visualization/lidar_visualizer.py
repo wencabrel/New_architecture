@@ -241,29 +241,58 @@ class LiDARVisualizer:
         # Set up control buttons
         self._setup_buttons()
     
+    # Add this to the _setup_buttons method in lidar_visualizer.py
     def _setup_buttons(self):
         """Set up control buttons for the visualization"""
         # Make room for buttons
         plt.subplots_adjust(bottom=0.15)
         
         # Pause/Play button
-        pause_button_ax = plt.axes([0.4, 0.05, 0.1, 0.04])
+        pause_button_ax = plt.axes([0.3, 0.05, 0.1, 0.04])
         self.pause_button = Button(pause_button_ax, 'Pause', color='lightcoral', hovercolor='0.9')
         self.pause_button.on_clicked(self.toggle_pause)
         
         # Only add follow and save buttons if we have an occupancy grid
         if self.occupancy_grid and self.ax2:
             # Follow Robot button
-            follow_button_ax = plt.axes([0.55, 0.05, 0.1, 0.04])
+            follow_button_ax = plt.axes([0.45, 0.05, 0.1, 0.04])
             self.follow_button = Button(follow_button_ax, 'Following', 
-                                      color='lightgoldenrodyellow', hovercolor='0.975')
+                                    color='lightgoldenrodyellow', hovercolor='0.975')
             self.follow_button.on_clicked(self.toggle_follow)
             
+            # View Full Map button
+            view_map_button_ax = plt.axes([0.6, 0.05, 0.1, 0.04])
+            self.view_map_button = Button(view_map_button_ax, 'View Full Map', 
+                                        color='lightcyan', hovercolor='0.8')
+            self.view_map_button.on_clicked(self.view_full_map)
+            
             # Save Map button
-            save_button_ax = plt.axes([0.7, 0.05, 0.1, 0.04])
+            save_button_ax = plt.axes([0.75, 0.05, 0.1, 0.04])
             self.save_button = Button(save_button_ax, 'Save Map', 
-                                     color='lightblue', hovercolor='0.8')
+                                    color='lightblue', hovercolor='0.8')
             self.save_button.on_clicked(self.save_current_map)
+
+    # Add this method to the LiDARVisualizer class
+    def view_full_map(self, event):
+        """Adjust the view to show the full map"""
+        if not self.ax2 or not self.occupancy_grid:
+            return
+        
+        # Temporarily disable following
+        self.follow_robot = False
+        if self.follow_button:
+            self.follow_button.label.set_text('Not Following')
+        
+        # Get grid dimensions
+        width = self.occupancy_grid.width
+        height = self.occupancy_grid.height
+        
+        # Set limits to show the full grid
+        self.ax2.set_xlim(-width/2, width/2)
+        self.ax2.set_ylim(-height/2, height/2)
+        
+        # Redraw the figure
+        self.fig.canvas.draw_idle()
     
     def toggle_pause(self, event):
         """Toggle animation pause/play"""

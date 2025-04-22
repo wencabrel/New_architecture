@@ -154,7 +154,7 @@ class SLAMCoordinator:
         if self.occupancy_grid is None:
             # Estimate grid size based on potential scan range
             # This is a conservative estimate and may need adjustment for your environment
-            max_range = 30.0  # Typical max range for LiDAR in meters
+            max_range = 50.0  # Typical max range for LiDAR in meters
             grid_width = int(max_range * 4 / self.grid_resolution)
             grid_height = int(max_range * 4 / self.grid_resolution)
             

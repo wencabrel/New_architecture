@@ -18,9 +18,9 @@ from scipy.ndimage import gaussian_filter
 # Add the parent directory to the path to import the modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from lidar_slam.lidar_processing import data_parser, scan_converter
-from lidar_slam.mapping import occupancy_grid
-from lidar_slam.utils import file_utils
+from lidar_processing import data_parser, scan_converter
+from mapping import occupancy_grid
+from utils import file_utils
 
 class ScanMatcher:
     """
