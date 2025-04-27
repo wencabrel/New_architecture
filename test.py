@@ -6,7 +6,11 @@ from matplotlib.patches import Rectangle
 import math
 import os
 import time
+import math
+from scipy.spatial import KDTree
+from scipy import optimize
 from matplotlib.widgets import Button
+from matplotlib.widgets import Button, CheckButtons
 
 def parse_lidar_data(data_string):
     """Parse the LiDAR data string and extract all relevant information"""
@@ -126,6 +130,176 @@ def read_lidar_data_from_file(file_path, max_entries=200):
         print(f"Error reading file {file_path}: {e}")
     
     return parsed_data_list
+
+
+class ScanMatcher:
+    """
+    Class to perform scan matching between consecutive LiDAR scans
+    using Iterative Closest Point (ICP) algorithm.
+    """
+    
+    def __init__(self, max_iterations=50, distance_threshold=10, 
+                 convergence_threshold=1e-5, min_match_points=1):
+        """
+        Initialize the scan matcher with parameters for ICP algorithm
+        
+        Args:
+            max_iterations: Maximum number of iterations for ICP
+            distance_threshold: Maximum distance between points to consider as correspondence
+            convergence_threshold: Threshold for stopping iterations when changes are small
+            min_match_points: Minimum number of matching points required for valid scan matching
+        """
+        self.max_iterations = max_iterations
+        self.distance_threshold = distance_threshold
+        self.convergence_threshold = convergence_threshold
+        self.min_match_points = min_match_points
+        
+        # Store previous scan
+        self.prev_scan_points = None
+        
+        # Store cumulative correction to pose
+        self.cumulative_correction = {'x': 0.0, 'y': 0.0, 'theta': 0.0}
+        
+        # Error metrics
+        self.last_match_error = None
+        self.valid_match_points = 0
+        
+    def set_reference_scan(self, x_points, y_points):
+        """
+        Set the reference scan (points in world coordinates)
+        
+        Args:
+            x_points: List of x coordinates of scan points
+            y_points: List of y coordinates of scan points
+        """
+        # Convert to numpy arrays for efficiency
+        points = np.column_stack((x_points, y_points))
+        self.prev_scan_points = points
+    
+    def match_scans(self, current_x, current_y, pose):
+        """
+        Match current scan with previous reference scan and return corrected pose
+        
+        Args:
+            current_x: List of x coordinates of current scan points
+            current_y: List of y coordinates of current scan points
+            pose: Current estimated pose dictionary with 'x', 'y', 'theta' keys
+            
+        Returns:
+            Corrected pose dictionary with 'x', 'y', 'theta' keys
+        """
+        # If this is the first scan, we can't match, so just set it as reference
+        if self.prev_scan_points is None or len(current_x) < self.min_match_points:
+            self.set_reference_scan(current_x, current_y)
+            return pose.copy()
+        
+        # Create numpy array for current scan
+        current_points = np.column_stack((current_x, current_y))
+        
+        # Initial transformation based on current pose estimate
+        initial_transform = self._create_transform(pose['x'], pose['y'], pose['theta'])
+        
+        # Optimization function to find the best transformation
+        def objective_function(params):
+            # Extract transformation parameters
+            tx, ty, theta = params
+            
+            # Create transformation matrix
+            transform = self._create_transform(tx, ty, theta)
+            
+            # Find nearest neighbors for each point in current scan
+            if len(current_points) > 0 and len(self.prev_scan_points) > 0:
+                tree = KDTree(self.prev_scan_points)
+                distances, indices = tree.query(current_points, k=1, distance_upper_bound=self.distance_threshold)
+                
+                # Calculate transformation error (sum of squared distances)
+                valid_indices = np.isfinite(distances)
+                self.valid_match_points = np.sum(valid_indices)
+                
+                if self.valid_match_points > self.min_match_points:
+                    # Calculate mean squared error for valid matches
+                    error = np.sum(distances[valid_indices] ** 2) / self.valid_match_points
+                    return error
+            
+            # Return high error if not enough matching points
+            return 1000.0
+        
+        # Initial parameters - start with the current pose
+        initial_params = [pose['x'], pose['y'], pose['theta']]
+        # print(f"Initial parameters: {initial_params}\n")
+        
+        # Run optimization
+        try:
+            result = optimize.minimize(
+                objective_function,
+                initial_params,
+                method='Powell',  # Powell method doesn't require derivatives
+                options={'maxiter': self.max_iterations, 'ftol': self.convergence_threshold}
+            )
+            
+            # Get optimized parameters
+            optimized_x, optimized_y, optimized_theta = result.x
+            # print(f"Optimized parameters: {optimized_x}, {optimized_y}, {optimized_theta}")
+            
+            # Store match error
+            self.last_match_error = result.fun
+            
+            # Update cumulative correction
+            self.cumulative_correction['x'] += (optimized_x - pose['x'])
+            self.cumulative_correction['y'] += (optimized_y - pose['y'])
+            self.cumulative_correction['theta'] += (optimized_theta - pose['theta'])
+            
+            # Create corrected pose
+            corrected_pose = {
+                'x': optimized_x,
+                'y': optimized_y,
+                'theta': optimized_theta
+            }
+            
+            # Set current scan as reference for next match
+            self.set_reference_scan(current_x, current_y)
+            
+            return corrected_pose
+            
+        except Exception as e:
+            print(f"Scan matching failed: {e}")
+            return pose.copy()  # Return original pose if optimization fails
+    
+    def _create_transform(self, tx, ty, theta):
+        """
+        Create a 2D transformation matrix for the given translation and rotation
+        
+        Args:
+            tx: Translation in x direction
+            ty: Translation in y direction
+            theta: Rotation angle in radians
+            
+        Returns:
+            3x3 homogeneous transformation matrix
+        """
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        
+        transform = np.array([
+            [cos_theta, -sin_theta, tx],
+            [sin_theta, cos_theta, ty],
+            [0, 0, 1]
+        ])
+        
+        return transform
+    
+    def get_match_quality(self):
+        """
+        Get information about the quality of the last scan match
+        
+        Returns:
+            Dictionary with match quality metrics
+        """
+        return {
+            'error': self.last_match_error,
+            'valid_points': self.valid_match_points,
+            'cumulative_correction': self.cumulative_correction.copy()
+        }
 
 class OccupancyGrid:
     """Class to handle occupancy grid mapping from LiDAR data"""
@@ -425,28 +599,36 @@ class OccupancyGrid:
         
         return saved_files
 
+# This function integrates scan matching into the animation system from the original code
 
-def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan=True, flip_theta=False, 
-                      show_occupancy_grid=True, grid_resolution=0.05, save_grid=False,
-                      save_format='png', save_path='maps/'):
+def animate_lidar_data_with_scan_matching(parsed_data_list, flip_x=False, flip_y=True, reverse_scan=True, 
+                                         flip_theta=False, show_occupancy_grid=True, grid_resolution=0.05, 
+                                         save_grid=False, save_format='png', save_path='maps/',
+                                         use_scan_matching=True):
     """
-    Animate LiDAR scans showing robot movement based on pose with interactive zooming
+    Animate LiDAR scans showing robot movement based on pose with scan matching correction
     
     Args:
         parsed_data_list: List of parsed LiDAR data dictionaries
-        flip_x: Whether to flip the x-axis
-        flip_y: Whether to flip the y-axis
-        reverse_scan: Whether to reverse the scan direction
-        flip_theta: Whether to negate the orientation angle
-        show_occupancy_grid: Whether to show the occupancy grid
+        flip_x, flip_y, reverse_scan, flip_theta: Orientation parameters
+        show_occupancy_grid: Whether to show the occupancy grid visualization
         grid_resolution: Resolution of the occupancy grid in meters
-        save_grid: Whether to save the final occupancy grid
+        save_grid: Whether to save the final occupancy grid map
         save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
         save_path: Directory to save the grid
+        use_scan_matching: Whether to use scan matching to correct pose
     """
     if not parsed_data_list:
         print("No data to animate.")
         return None
+    
+    # Create a scan matcher if enabled
+    scan_matcher = ScanMatcher(
+        max_iterations=30, 
+        distance_threshold=0.5, 
+        convergence_threshold=1e-4, 
+        min_match_points=10
+    ) if use_scan_matching else None
     
     # Assuming the LiDAR scan covers 180 degrees (π radians)
     angle_min = -math.pi/2
@@ -487,95 +669,11 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
                                       width=grid_width, 
                                       height=grid_height)
     
-    # Store robot path (applying the same transformations)
-    robot_path_x = []
-    robot_path_y = []
-    for data in parsed_data_list:
-        x, y = data['pose']['x'], data['pose']['y']
-        if flip_x:
-            x = -x
-        if flip_y:
-            y = -y
-        robot_path_x.append(x)
-        robot_path_y.append(y)
-    
-    # Calculate time difference between timestamps
-    timestamps = [data['timestamp'] for data in parsed_data_list]
-    start_time = timestamps[0]
-    time_diffs = [t - start_time for t in timestamps]
-    
-def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan=True, flip_theta=False, 
-                      show_occupancy_grid=True, grid_resolution=0.05, save_grid=False,
-                      save_format='png', save_path='maps/'):
-    """
-    Animate LiDAR scans showing robot movement based on pose with interactive zooming
-    
-    Args:
-        parsed_data_list: List of parsed LiDAR data dictionaries
-        flip_x: Whether to flip the x-axis
-        flip_y: Whether to flip the y-axis
-        reverse_scan: Whether to reverse the scan direction
-        flip_theta: Whether to negate the orientation angle
-        show_occupancy_grid: Whether to show the occupancy grid
-        grid_resolution: Resolution of the occupancy grid in meters
-        save_grid: Whether to save the final occupancy grid
-        save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
-        save_path: Directory to save the grid
-    """
-    if not parsed_data_list:
-        print("No data to animate.")
-        return None
-    
-    # Assuming the LiDAR scan covers 180 degrees (π radians)
-    angle_min = -math.pi/2
-    angle_max = math.pi/2
-    
-    # Find max range for consistent scaling by converting all data points
-    all_x_points = []
-    all_y_points = []
-    for parsed_data in parsed_data_list:
-        x_points, y_points = convert_scans_to_cartesian(
-            parsed_data['scan_ranges'], angle_min, angle_max, parsed_data['pose'],
-            flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
-        )
-        all_x_points.extend(x_points)
-        all_y_points.extend(y_points)
-    
-    # Calculate proper axis limits for visualization
-    x_min, x_max = min(all_x_points), max(all_x_points)
-    y_min, y_max = min(all_y_points), max(all_y_points)
-    
-    # Add some padding (20%)
-    x_padding = max(1.0, (x_max - x_min) * 0.2)
-    y_padding = max(1.0, (y_max - y_min) * 0.2)
-    
-    # Set limits with padding
-    x_min -= x_padding
-    x_max += x_padding
-    y_min -= y_padding
-    y_max += y_padding
-    
-    # Calculate grid dimensions based on data range
-    grid_width = max(20, int(math.ceil((x_max - x_min) * 1.5)))  # Make grid at least 20m wide
-    grid_height = max(20, int(math.ceil((y_max - y_min) * 1.5)))  # Make grid at least 20m tall
-    
-    # Initialize occupancy grid
-    if show_occupancy_grid:
-        occupancy_grid = OccupancyGrid(resolution=grid_resolution, 
-                                      width=grid_width, 
-                                      height=grid_height)
-    
-    # Store robot path (applying the same transformations)
-    robot_path_x = []
-    robot_path_y = []
-    for data in parsed_data_list:
-        x, y = data['pose']['x'], data['pose']['y']
-        if flip_x:
-            x = -x
-        if flip_y:
-            y = -y
-        robot_path_x.append(x)
-        robot_path_y.append(y)
+    # Store robot paths (both original and corrected)
+    original_path_x = []
+    original_path_y = []
+    corrected_path_x = []
+    corrected_path_y = []
     
     # Calculate time difference between timestamps
     timestamps = [data['timestamp'] for data in parsed_data_list]
@@ -605,8 +703,9 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         # Add reference grid lines
         ax2.grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
         
-        # Create a line for robot path on the occupancy grid
-        grid_path_line, = ax2.plot([], [], 'r-', linewidth=2, label='Robot Path')
+        # Create lines for robot paths on the occupancy grid
+        grid_orig_path_line, = ax2.plot([], [], 'r--', linewidth=1, alpha=0.6, label='Original Path')
+        grid_corr_path_line, = ax2.plot([], [], 'g-', linewidth=2, label='Corrected Path')
         
         # Also plot the starting position on the grid
         grid_start_point = ax2.scatter([], [], c='green', s=100, marker='*', label='Start')
@@ -619,6 +718,10 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         grid_robot_id_text = ax2.text(0.02, 0.94, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
         grid_pose_text = ax2.text(0.02, 0.90, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
         grid_settings_text = ax2.text(0.02, 0.86, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
+        
+        # Add scan matching metrics text
+        grid_scan_match_text = ax2.text(0.02, 0.82, "", transform=ax2.transAxes, va='top', ha='left', color='green')
+        grid_correction_text = ax2.text(0.02, 0.78, "", transform=ax2.transAxes, va='top', ha='left', color='green')
         
         # Add zoom information text
         zoom_info_text = ax2.text(0.5, 0.02, "Left-click: Zoom in | Right-click: Zoom out | Middle-click: Reset zoom", 
@@ -641,18 +744,47 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         # Flag to determine if we're following the robot
         follow_robot = [True]
         
-        # Add a Follow Robot button
-        plt.subplots_adjust(bottom=0.15)  # Make room for buttons
+        # Add buttons and checkboxes for control
+        plt.subplots_adjust(bottom=0.2)  # Make room for buttons
+        
+        # Follow Robot button
         follow_button_ax = plt.axes([0.85, 0.05, 0.1, 0.04])
         follow_button = Button(follow_button_ax, 'Follow Robot', color='lightgoldenrodyellow', hovercolor='0.975')
         
-        # Add a Save Map button
+        # Save Map button
         save_button_ax = plt.axes([0.70, 0.05, 0.1, 0.04])
         save_button = Button(save_button_ax, 'Save Map', color='lightblue', hovercolor='0.8')
+        
+        # Scan Matching toggle checkbox
+        scan_match_ax = plt.axes([0.55, 0.05, 0.1, 0.04])
+        scan_match_check = CheckButtons(scan_match_ax, ['Scan Matching'], [use_scan_matching])
+        
+        # Original Path toggle checkbox
+        show_orig_path_ax = plt.axes([0.40, 0.05, 0.1, 0.04])
+        show_orig_path_check = CheckButtons(show_orig_path_ax, ['Show Original'], [True])
         
         def toggle_follow(event):
             follow_robot[0] = not follow_robot[0]
             follow_button.label.set_text('Following' if follow_robot[0] else 'Not Following')
+        
+        def toggle_scan_matching(label):
+            nonlocal use_scan_matching, scan_matcher
+            use_scan_matching = not use_scan_matching
+            
+            # Create a new scan matcher if none exists
+            if use_scan_matching and scan_matcher is None:
+                scan_matcher = ScanMatcher(
+                    max_iterations=30, 
+                    distance_threshold=0.5, 
+                    convergence_threshold=1e-4, 
+                    min_match_points=10
+                )
+        
+        def toggle_original_path(label):
+            # Toggle visibility of original path line
+            visible = grid_orig_path_line.get_visible()
+            grid_orig_path_line.set_visible(not visible)
+            fig.canvas.draw_idle()
             
         def save_current_map(event):
             if not show_occupancy_grid:
@@ -669,8 +801,10 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
             
             # Get the current path based on the frame we're displaying
             current_frame = current_frame_index[0]
-            displayed_path_x = robot_path_x[:current_frame+1]
-            displayed_path_y = robot_path_y[:current_frame+1]
+            
+            # Use corrected path for saving
+            displayed_path_x = corrected_path_x[:current_frame+1]
+            displayed_path_y = corrected_path_y[:current_frame+1]
             
             # Create path coordinates for saving
             displayed_path_coords = list(zip(displayed_path_x, displayed_path_y))
@@ -693,6 +827,8 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
             
         follow_button.on_clicked(toggle_follow)
         save_button.on_clicked(save_current_map)
+        scan_match_check.on_clicked(toggle_scan_matching)
+        show_orig_path_check.on_clicked(toggle_original_path)
         
         # Define click event handler for zooming
         def on_click(event):
@@ -740,7 +876,7 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         fig.canvas.mpl_connect('button_press_event', on_click)
         
         # Set occupancy grid plot properties
-        ax2.set_title('Occupancy Grid Map')
+        ax2.set_title('Occupancy Grid Map with Scan Matching')
         ax2.set_xlabel('X (meters)')
         ax2.set_ylabel('Y (meters)')
         ax2.set_aspect('equal')
@@ -759,17 +895,28 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
     # Create a scatter plot for robot position
     robot_pos = ax.scatter([], [], c='red', s=100, marker='*', label='Robot Position')
     
-    # Create a line for robot path
-    path_line, = ax.plot([], [], 'g-', linewidth=2, label='Robot Path')
+    # Create lines for robot paths
+    orig_path_line, = ax.plot([], [], 'r--', linewidth=1, alpha=0.6, label='Original Path')
+    corr_path_line, = ax.plot([], [], 'g-', linewidth=2, label='Corrected Path')
     
     # Initialize text objects for information display
     timestamp_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, va='top', ha='left')
     robot_id_text = ax.text(0.02, 0.94, "", transform=ax.transAxes, va='top', ha='left')
     pose_text = ax.text(0.02, 0.90, "", transform=ax.transAxes, va='top', ha='left')
     settings_text = ax.text(0.02, 0.86, "", transform=ax.transAxes, va='top', ha='left')
+    scan_match_text = ax.text(0.02, 0.82, "", transform=ax.transAxes, va='top', ha='left', color='green')
     
     # Initialize arrow for robot orientation
     arrow = None
+    
+    # Store scan matching stats for display
+    match_stats = {
+        'error': None,
+        'valid_points': 0,
+        'correction_x': 0.0,
+        'correction_y': 0.0,
+        'correction_theta': 0.0
+    }
     
     def init():
         ax.set_xlim(x_min, x_max)
@@ -778,11 +925,11 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         ax.set_aspect('equal')
         ax.set_xlabel('X (meters)')
         ax.set_ylabel('Y (meters)')
-        ax.set_title('2D LiDAR Scan Visualization')
+        ax.set_title('2D LiDAR Scan with Scan Matching')
         ax.legend(loc='upper right')
         
         # Show orientation settings
-        settings_str = f"Settings: flip_x={flip_x}, flip_y={flip_y}, reverse_scan={reverse_scan}, flip_theta={flip_theta}"
+        settings_str = f"Settings: flip_x={flip_x}, flip_y={flip_y}, reverse={reverse_scan}, flip_θ={flip_theta}"
         settings_text.set_text(settings_str)
         
         # Set robot ID text
@@ -791,20 +938,26 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         robot_id_text.set_text(robot_id_str)
         
         if show_occupancy_grid:
-            # Initialize the grid path with the starting point
-            if len(robot_path_x) > 0:
-                grid_start_point.set_offsets([[robot_path_x[0], robot_path_y[0]]])
-                grid_current_pos.set_offsets([[robot_path_x[0], robot_path_y[0]]])
-            
-            # Initialize text on grid
+            # Initialize the grid settings text
             grid_settings_text.set_text(settings_str)
             grid_robot_id_text.set_text(robot_id_str)
             
-            return (scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, settings_text, 
-                   grid_img, grid_path_line, grid_start_point, grid_current_pos, grid_timestamp_text, grid_robot_id_text, 
-                   grid_pose_text, grid_settings_text)
+            # Initialize scan matching info
+            if use_scan_matching:
+                scan_match_info = "Scan Matching: Enabled"
+            else:
+                scan_match_info = "Scan Matching: Disabled"
+            grid_scan_match_text.set_text(scan_match_info)
+            grid_correction_text.set_text("Cumulative correction: x=0.000, y=0.000, θ=0.000")
+            
+            return (scatter, robot_pos, orig_path_line, corr_path_line, timestamp_text, robot_id_text, 
+                   pose_text, settings_text, scan_match_text, grid_img, grid_orig_path_line, 
+                   grid_corr_path_line, grid_start_point, grid_current_pos, grid_timestamp_text, 
+                   grid_robot_id_text, grid_pose_text, grid_settings_text, grid_scan_match_text, 
+                   grid_correction_text)
         else:
-            return scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, settings_text
+            return (scatter, robot_pos, orig_path_line, corr_path_line, timestamp_text, 
+                   robot_id_text, pose_text, settings_text, scan_match_text)
     
     def update(frame):
         nonlocal arrow
@@ -820,38 +973,102 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
             flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
         )
         
-        # Update LiDAR points
+        # Get original robot pose
+        original_pose = parsed_data['pose'].copy()
+        
+        # Apply coordinate system transformations to original pose for visualization
+        original_x, original_y = original_pose['x'], original_pose['y']
+        original_theta = original_pose['theta']
+        
+        if flip_x:
+            original_x = -original_x
+        if flip_y:
+            original_y = -original_y
+        if flip_theta:
+            original_theta = -original_theta
+            
+        # Store original pose for path visualization
+        if frame == 0:
+            original_path_x.clear()
+            original_path_y.clear()
+            corrected_path_x.clear()
+            corrected_path_y.clear()
+            
+            # Initialize with starting point
+            original_path_x.append(original_x)
+            original_path_y.append(original_y)
+            corrected_path_x.append(original_x)
+            corrected_path_y.append(original_y)
+        elif frame < len(parsed_data_list):
+            original_path_x.append(original_x)
+            original_path_y.append(original_y)
+        
+        # Apply scan matching to get corrected pose if enabled
+        if use_scan_matching and scan_matcher is not None:
+            # Create a temporary pose dictionary with transformed coordinates
+            temp_pose = {
+                'x': original_x,
+                'y': original_y,
+                'theta': original_theta
+            }
+            
+            # Apply scan matching to correct the pose
+            corrected_pose = scan_matcher.match_scans(x_points, y_points, temp_pose)
+            
+            # Get match quality metrics
+            match_quality = scan_matcher.get_match_quality()
+            match_stats['error'] = match_quality['error']
+            match_stats['valid_points'] = match_quality['valid_points']
+            match_stats['correction_x'] = match_quality['cumulative_correction']['x']
+            match_stats['correction_y'] = match_quality['cumulative_correction']['y']
+            match_stats['correction_theta'] = match_quality['cumulative_correction']['theta']
+            
+            # Use corrected pose for visualization
+            robot_x, robot_y = corrected_pose['x'], corrected_pose['y']
+            robot_theta = corrected_pose['theta']
+            
+            # Add to corrected path
+            if frame < len(parsed_data_list):
+                corrected_path_x.append(robot_x)
+                corrected_path_y.append(robot_y)
+                
+            # Update scan match text display
+            if match_stats['error'] is None:
+                match_str = f"Scan match: {match_stats['valid_points']} pts, error: N/A"
+            else:
+                match_str = f"Scan match: {match_stats['valid_points']} pts, error: {match_stats['error']:.6f}"
+            correction_str = f"Correction: x={match_stats['correction_x']:.3f}, y={match_stats['correction_y']:.3f}, θ={match_stats['correction_theta']:.3f}"
+            scan_match_text.set_text(match_str)
+            
+            if show_occupancy_grid:
+                grid_scan_match_text.set_text(match_str)
+                grid_correction_text.set_text(correction_str)
+        else:
+            # Use original pose without correction
+            robot_x, robot_y = original_x, original_y
+            robot_theta = original_theta
+            
+            # Add to corrected path (same as original in this case)
+            if frame < len(parsed_data_list) and frame > 0:
+                corrected_path_x.append(robot_x)
+                corrected_path_y.append(robot_y)
+            
+            # Update scan match text display
+            scan_match_text.set_text("Scan matching: Disabled")
+            
+            if show_occupancy_grid:
+                grid_scan_match_text.set_text("Scan matching: Disabled")
+                grid_correction_text.set_text("Cumulative correction: N/A")
+        
+        # Update LiDAR points display
         scatter.set_offsets(np.column_stack((x_points, y_points)))
         
-        # Get transformed robot pose for visualization
-        robot_x, robot_y = parsed_data['pose']['x'], parsed_data['pose']['y']
-        if flip_x:
-            robot_x = -robot_x
-        if flip_y:
-            robot_y = -robot_y
-        
-        # Store current robot position for zoom centering
-        if show_occupancy_grid:
-            current_robot_pos[0] = robot_x
-            current_robot_pos[1] = robot_y
-            
-            # If following robot is enabled, center the view on the robot
-            if follow_robot[0]:
-                # Get current zoom level (width and height)
-                xmin, xmax = ax2.get_xlim()
-                ymin, ymax = ax2.get_ylim()
-                width = xmax - xmin
-                height = ymax - ymin
-                
-                # Center on robot position while maintaining zoom level
-                ax2.set_xlim(robot_x - width/2, robot_x + width/2)
-                ax2.set_ylim(robot_y - height/2, robot_y + height/2)
-        
-        # Update robot position
+        # Update robot position display
         robot_pos.set_offsets([[robot_x, robot_y]])
         
-        # Update robot path
-        path_line.set_data(robot_path_x[:frame+1], robot_path_y[:frame+1])
+        # Update path lines
+        orig_path_line.set_data(original_path_x, original_path_y)
+        corr_path_line.set_data(corrected_path_x, corrected_path_y)
         
         # Update text information
         elapsed_time = time_diffs[frame]
@@ -862,82 +1079,99 @@ def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=True, reverse_scan
         robot_id_str = f"Robot ID: {parsed_data['robot_id']}"
         robot_id_text.set_text(robot_id_str)
         
-        # Show original pose values
-        pose_str = f"Pose: x={parsed_data['pose']['x']:.3f}, y={parsed_data['pose']['y']:.3f}, θ={parsed_data['pose']['theta']:.3f}"
+        # Show pose information (original values from file)
+        pose_str = f"Original pose: x={parsed_data['pose']['x']:.3f}, y={parsed_data['pose']['y']:.3f}, θ={parsed_data['pose']['theta']:.3f}"
+        if use_scan_matching:
+            pose_str += f"\nCorrected: x={robot_x:.3f}, y={robot_y:.3f}, θ={robot_theta:.3f}"
         pose_text.set_text(pose_str)
         
         # Update robot orientation arrow
         if arrow:
             arrow.remove()
         
-        # Apply orientation transformation
-        theta = parsed_data['pose']['theta']
-        if flip_theta:
-            theta = -theta
-        
+        # Draw arrow showing robot orientation
         arrow_length = 0.5
-        dx = arrow_length * math.cos(theta)
-        dy = arrow_length * math.sin(theta)
-        
-        if flip_x:
-            dx = -dx
-        if flip_y:
-            dy = -dy
+        dx = arrow_length * math.cos(robot_theta)
+        dy = arrow_length * math.sin(robot_theta)
             
         arrow = ax.arrow(robot_x, robot_y, dx, dy, 
                         head_width=0.1, head_length=0.1, fc='red', ec='red')
         
         # Update occupancy grid if enabled
         if show_occupancy_grid:
-            # Update the grid with current scan
+            # Update the grid with current scan and corrected pose
             occupancy_grid.update_grid(robot_x, robot_y, x_points, y_points)
             
             # Update the grid image
             grid_img.set_data(occupancy_grid.get_grid_for_display())
             
-            # Update the robot path on the grid map
-            grid_path_line.set_data(robot_path_x[:frame+1], robot_path_y[:frame+1])
+            # Update robot path on grid
+            grid_orig_path_line.set_data(original_path_x, original_path_y)
+            grid_corr_path_line.set_data(corrected_path_x, corrected_path_y)
             
-            # Update the current position marker
+            # Update starting point marker
+            if frame == 0:
+                grid_start_point.set_offsets([[corrected_path_x[0], corrected_path_y[0]]])
+            
+            # Update current position marker
             grid_current_pos.set_offsets([[robot_x, robot_y]])
+            
+            # Store current robot position for following
+            current_robot_pos[0] = robot_x
+            current_robot_pos[1] = robot_y
+            
+            # Follow robot if enabled
+            if follow_robot[0]:
+                # Get current viewport dimensions
+                xmin, xmax = ax2.get_xlim()
+                ymin, ymax = ax2.get_ylim()
+                width = xmax - xmin
+                height = ymax - ymin
+                
+                # Center on robot position while maintaining zoom level
+                ax2.set_xlim(robot_x - width/2, robot_x + width/2)
+                ax2.set_ylim(robot_y - height/2, robot_y + height/2)
             
             # Update text information on grid
             grid_timestamp_text.set_text(timestamp_str)
             grid_robot_id_text.set_text(robot_id_str)
             grid_pose_text.set_text(pose_str)
             
-            return (scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, 
-                   settings_text, arrow, grid_img, grid_path_line, grid_current_pos, grid_timestamp_text, 
-                   grid_robot_id_text, grid_pose_text, grid_settings_text)
+            return (scatter, robot_pos, orig_path_line, corr_path_line, timestamp_text, robot_id_text, 
+                   pose_text, settings_text, scan_match_text, arrow, grid_img, grid_orig_path_line, 
+                   grid_corr_path_line, grid_start_point, grid_current_pos, grid_timestamp_text, 
+                   grid_robot_id_text, grid_pose_text, grid_settings_text, grid_scan_match_text, 
+                   grid_correction_text)
         else:
-            return scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, settings_text, arrow
+            return (scatter, robot_pos, orig_path_line, corr_path_line, timestamp_text, 
+                   robot_id_text, pose_text, settings_text, scan_match_text, arrow)
     
-    # Create animation with faster frame rate for smoother visualization
+    # Create animation with a faster frame rate for smoother visualization
     animation = FuncAnimation(fig, update, frames=len(parsed_data_list), 
                              init_func=init, interval=10, blit=False)
     
     plt.tight_layout()
     plt.show()
     
-    # Note: The save functionality is now handled by the Save Map button
-    # If you still want to automatically save at the end, you can use:
-    # if save_grid and show_occupancy_grid:
-    #     save_current_map(None)  # Call the save function without an event
-    
+    # Return the animation object
     return animation
 
-def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_grid=True, 
-                             grid_resolution=0.05, save_grid=True, save_format='all'):
+
+# Main function to run the enhanced visualization with scan matching
+def visualize_lidar_data_with_scan_matching(file_path, max_entries=200, 
+                                          show_occupancy_grid=True, grid_resolution=0.05,
+                                          save_grid=True, save_format='all', use_scan_matching=True):
     """
-    Main function to visualize LiDAR data in real-time with occupancy grid mapping
+    Main function to visualize LiDAR data with scan matching for improved mapping
     
     Args:
         file_path: Path to the LiDAR data file
         max_entries: Maximum number of entries to read from the file
         show_occupancy_grid: Whether to show the occupancy grid visualization
-        grid_resolution: Resolution of the occupancy grid in meters (smaller = more detail but slower)
-        save_grid: Whether to save the final occupancy grid map to a file
+        grid_resolution: Resolution of the occupancy grid in meters
+        save_grid: Whether to save the final occupancy grid map
         save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
+        use_scan_matching: Whether to use scan matching to correct pose
     """
     print(f"Reading LiDAR data from: {file_path}")
     
@@ -962,13 +1196,14 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     print(f"  Number of entries: {len(parsed_data_list)}")
     print(f"  Robot ID: {parsed_data_list[0]['robot_id']}")
     print(f"  Data duration: {duration:.2f} seconds")
+    print(f"  Using scan matching: {'Yes' if use_scan_matching else 'No'}")
     
     if show_occupancy_grid:
         print(f"  Starting visualization with occupancy grid mapping (resolution: {grid_resolution}m)...")
         if save_grid:
             print(f"  The final occupancy grid will be saved in '{save_format}' format")
     else:
-        print(f"  Starting visualization with orientation correction...")
+        print(f"  Starting visualization without occupancy grid...")
     
     # Create output directory for maps
     maps_dir = "maps"
@@ -979,32 +1214,34 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         except Exception as e:
             print(f"  Error creating maps directory: {e}")
     
-    # Start the animation with corrected orientation (flip y-axis and reverse scan)
-    # These settings should fix the issue with the corner appearing on the wrong side
-    animate_lidar_data(
+    # Start the animation with scan matching
+    animate_lidar_data_with_scan_matching(
         parsed_data_list,
         flip_x=False,          # Whether to flip the x-axis
-        flip_y=False,           # Whether to flip the y-axis (common fix)
-        reverse_scan=True,     # Whether to reverse the scan direction (common fix) 
+        flip_y=False,           # Whether to flip the y-axis
+        reverse_scan=True,     # Whether to reverse the scan direction
         flip_theta=False,      # Whether to negate the orientation angle
         show_occupancy_grid=show_occupancy_grid,  # Whether to show occupancy grid
         grid_resolution=grid_resolution,          # Resolution of the grid in meters
         save_grid=save_grid,                      # Whether to save the final grid
         save_format=save_format,                  # Format to save the grid
-        save_path=maps_dir                        # Directory to save the grid
+        save_path=maps_dir,                       # Directory to save the grid
+        use_scan_matching=use_scan_matching       # Whether to use scan matching
     )
 
-# Main execution
+
+# Main execution example
 if __name__ == "__main__":
     # File path to read LiDAR data from
-    file_path = "./DataSet/RawData/raw_data_zjnu20_21_3F.clf"
+    file_path = "./lidar_slam/dataset/raw_data/raw_data_zjnu20_21_3F_short.clf"
     
-    # Run the visualization with occupancy grid mapping
-    visualize_lidar_data_realtime(
+    # Run the enhanced visualization with scan matching
+    visualize_lidar_data_with_scan_matching(
         file_path, 
-        max_entries=12430,
-        show_occupancy_grid=True,         # Enable occupancy grid mapping
-        grid_resolution=0.05,             # Grid resolution in meters (5cm per cell)
-        save_grid=True,                   # Save the final occupancy grid map
-        save_format='png'                 # Save in all available formats (png, npy, csv)
+        max_entries=2599,          # Number of entries to process
+        show_occupancy_grid=True,  # Enable occupancy grid mapping
+        grid_resolution=0.05,      # Grid resolution in meters (5cm per cell)
+        save_grid=True,            # Save the final occupancy grid map
+        save_format='png',         # Save format
+        use_scan_matching=True     # Enable scan matching for improved mapping
     )
