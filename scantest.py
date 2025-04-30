@@ -181,9 +181,12 @@ class OccupancyGrid:
         y = grid_y * self.resolution - self.origin_y
         return x, y
     
+    # Fix for the index error in update_grid method
+    # Replace the OccupancyGrid.update_grid method with this improved version
+
     def update_grid(self, robot_x, robot_y, scan_x, scan_y):
         """
-        Update the occupancy grid with a laser scan
+        Update the occupancy grid with a laser scan - with improved bounds checking
         
         Args:
             robot_x: Robot's x position in world coordinates
@@ -191,25 +194,55 @@ class OccupancyGrid:
             scan_x: List of scan x points in world coordinates
             scan_y: List of scan y points in world coordinates
         """
+        # Check if we need to expand the grid
+        need_expansion = False
+        
+        # Calculate the maximum extent of the scan
+        min_x = min(scan_x) if scan_x else 0
+        max_x = max(scan_x) if scan_x else 0
+        min_y = min(scan_y) if scan_y else 0
+        max_y = max(scan_y) if scan_y else 0
+        
+        # Check if scan points are near the grid boundary
+        if (abs(min_x) > 0.8 * self.width/2 or abs(max_x) > 0.8 * self.width/2 or
+            abs(min_y) > 0.8 * self.height/2 or abs(max_y) > 0.8 * self.height/2):
+            need_expansion = True
+        
+        # Expand the grid if needed - this must be done before processing the scan
+        if need_expansion:
+            self.expand_grid()
+        
         # Convert robot position to grid coordinates
         robot_grid_x, robot_grid_y = self.world_to_grid(robot_x, robot_y)
         
+        # Skip if robot is outside the grid
+        if robot_grid_x < 0 or robot_grid_x >= self.grid_width or robot_grid_y < 0 or robot_grid_y >= self.grid_height:
+            print(f"Warning: Robot position ({robot_x}, {robot_y}) is outside the grid. Skipping update.")
+            return
+        
         # Mark cells with scan points as occupied
         for x, y in zip(scan_x, scan_y):
-            # Check if the point is within the grid boundaries
-            if (abs(x) < self.width/2 and abs(y) < self.height/2):
-                # Convert scan point to grid coordinates
-                grid_x, grid_y = self.world_to_grid(x, y)
+            # Check if the point is within the grid boundaries with a buffer
+            buffer = 1.0  # 1 meter buffer
+            if (abs(x) >= self.width/2 - buffer or abs(y) >= self.height/2 - buffer):
+                continue
                 
-                # Mark the cell as occupied (update log odds)
-                self.log_odds_grid[grid_y, grid_x] += self.log_odds_occupied
-                
-                # Use bresenham's line algorithm to identify free cells along the ray
-                self.update_cells_along_ray(robot_grid_x, robot_grid_y, grid_x, grid_y)
+            # Convert scan point to grid coordinates
+            grid_x, grid_y = self.world_to_grid(x, y)
+            
+            # Double-check the grid bounds to be absolutely sure
+            if not (0 <= grid_x < self.grid_width and 0 <= grid_y < self.grid_height):
+                continue
+            
+            # Mark the cell as occupied (update log odds)
+            self.log_odds_grid[grid_y, grid_x] += self.log_odds_occupied
+            
+            # Use bresenham's line algorithm to identify free cells along the ray
+            self.update_cells_along_ray(robot_grid_x, robot_grid_y, grid_x, grid_y)
         
         # Convert log odds back to probabilities
         self.grid = 1 - (1 / (1 + np.exp(self.log_odds_grid)))
-    
+
     def update_cells_along_ray(self, x0, y0, x1, y1):
         """Mark cells along a ray from (x0,y0) to (x1,y1) as free using Bresenham's algorithm"""
         # Bresenham's line algorithm
@@ -222,7 +255,7 @@ class OccupancyGrid:
         while x0 != x1 or y0 != y1:
             # Mark the current cell as free (except the endpoint)
             if x0 != x1 or y0 != y1:  # Don't update the endpoint
-                # Ensure we're within grid bounds
+                # Ensure we're within grid bounds - CRITICAL CHECK
                 if 0 <= x0 < self.grid_width and 0 <= y0 < self.grid_height:
                     self.log_odds_grid[y0, x0] += self.log_odds_free
             
@@ -236,9 +269,54 @@ class OccupancyGrid:
             
             # Stop if we reach the endpoint or one cell before it
             if (x0 == x1 and y0 == y1) or \
-               (x0 + sx == x1 and y0 == y1) or \
-               (x0 == x1 and y0 + sy == y1):
+            (x0 + sx == x1 and y0 == y1) or \
+            (x0 == x1 and y0 + sy == y1):
                 break
+
+    def expand_grid(self):
+        """Expand the grid when needed to accommodate robot movement"""
+        # Save current map data
+        old_grid = self.grid.copy()
+        old_log_odds_grid = self.log_odds_grid.copy()
+        old_width = self.width
+        old_height = self.height
+        old_grid_width = self.grid_width
+        old_grid_height = self.grid_height
+        
+        # Calculate new dimensions (50% larger)
+        expansion_factor = 1.5
+        new_width = old_width * expansion_factor
+        new_height = old_height * expansion_factor
+        
+        # Create new grids with expanded dimensions
+        new_grid_width = int(new_width / self.resolution)
+        new_grid_height = int(new_height / self.resolution)
+        
+        # Initialize new grids
+        new_grid = np.ones((new_grid_height, new_grid_width)) * 0.5
+        new_log_odds_grid = np.zeros((new_grid_height, new_grid_width))
+        
+        # Calculate offsets to center old grid in new grid
+        offset_x = (new_grid_width - old_grid_width) // 2
+        offset_y = (new_grid_height - old_grid_height) // 2
+        
+        # Copy old grids to center of new grids
+        new_grid[offset_y:offset_y+old_grid_height, offset_x:offset_x+old_grid_width] = old_grid
+        new_log_odds_grid[offset_y:offset_y+old_grid_height, offset_x:offset_x+old_grid_width] = old_log_odds_grid
+        
+        # Update map attributes
+        self.width = new_width
+        self.height = new_height
+        self.grid_width = new_grid_width
+        self.grid_height = new_grid_height
+        self.grid = new_grid
+        self.log_odds_grid = new_log_odds_grid
+        
+        # Update origin to keep it centered
+        self.origin_x = new_width / 2
+        self.origin_y = new_height / 2
+        
+        print(f"Grid expanded from {old_width:.1f}x{old_height:.1f}m to {new_width:.1f}x{new_height:.1f}m ({new_grid_width}x{new_grid_height} cells)")
     
     def get_grid_for_display(self):
         """Get a copy of the grid suitable for display"""
@@ -2367,7 +2445,7 @@ def main():
     # Add arguments
     parser.add_argument('--file', type=str, default="./lidar_slam/dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=50,
+    parser.add_argument('--max_entries', type=int, default=338,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
