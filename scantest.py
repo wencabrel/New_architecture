@@ -543,7 +543,7 @@ class PoseEstimate:
 class ImprovedScanMatchingLocalization:
     """
     Improved implementation of scan matching localization using ICP algorithm
-    with proper frame transforms, odometry integration, and validation.
+    with adaptive parameters, alignment reset, and aggressive resampling to prevent unmapped regions.
     """
     
     def __init__(self, occupancy_grid=None, debug_level=1):
@@ -557,17 +557,36 @@ class ImprovedScanMatchingLocalization:
         self.map = occupancy_grid
         self.debug_level = debug_level
         
-        # ICP parameters - INCREASED CORRESPONDENCE DISTANCE
-        self.max_iterations = 15  # Increased from 10
+        # Default ICP parameters (will be adjusted adaptively)
+        self.max_iterations = 15
         self.convergence_threshold = 0.001
-        self.max_correspondence_distance = 1.5  # Increased from 0.5 to 1.5 meters
+        self.max_correspondence_distance = 1.5  # meters
         
-        # LOWERED THRESHOLDS for cell occupancy
-        self.occupancy_threshold = 0.55  # Lowered from 0.7 to 0.55
+        # Parameters for adaptive adjustment
+        self.default_correspondence_distance = 1.5  # Starting value
+        self.max_possible_correspondence_distance = 3.0  # Maximum allowed value
+        self.min_correspondence_distance = 1.0  # Minimum allowed value
         
-        # Motion validation parameters
+        # For aggressive resampling (when no correspondences found)
+        self.aggressive_max_correspondence_distance = 5.0  # Much larger search radius
+        self.aggressive_max_resampling_attempts = 5  # How many times to try resampling
+        
+        # Occupancy threshold (will be adjusted adaptively)
+        self.occupancy_threshold = 0.55
+        self.default_occupancy_threshold = 0.55  # Starting value
+        self.min_occupancy_threshold = 0.45  # Minimum allowed value
+        
+        # For aggressive resampling
+        self.aggressive_min_occupancy_threshold = 0.35  # Much lower threshold
+        
+        # Motion validation parameters (will be adjusted adaptively)
         self.max_translation_per_frame = 0.5  # meters
+        self.default_max_translation = 0.5  # Starting value
+        self.max_possible_translation = 1.0  # Maximum allowed value
+        
         self.max_rotation_per_frame = 0.5  # radians (~28 degrees)
+        self.default_max_rotation = 0.5  # Starting value
+        self.max_possible_rotation = 0.8  # Maximum allowed value
         
         # Current estimated trajectory
         self.trajectory = []  # List of PoseEstimate objects
@@ -593,14 +612,39 @@ class ImprovedScanMatchingLocalization:
         # Track the building progress for the map
         self.map_build_progress = 0
         
+        # Alignment reset tracking
+        self.frames_since_last_reset = 0
+        self.reset_interval = 50  # Check alignment every 50 frames
+        self.drift_threshold = 0.7  # Trigger reset if drift exceeds 0.7m
+        
+        # Match quality tracking
+        self.match_qualities = []  # Track recent match qualities
+        self.quality_history_size = 5  # How many recent matches to consider
+        
+        # Health monitoring
+        self.consecutive_poor_matches = 0
+        self.match_quality_threshold = 0.4  # Threshold for a "good" match
+        
+        # Recovery mode
+        self.in_recovery_mode = False
+        self.recovery_counter = 0
+        self.recovery_frames = 5  # How many frames to stay in recovery mode
+        
+        # Map expansion tracking
+        self.should_expand_map = False
+        self.force_map_expansion = False  # Used for emergency expansion
+        
+        # Resampling stats
+        self.resampling_attempts = 0  # Track how many times we've had to resample
+        self.frames_with_resampling = 0  # Track how many frames needed resampling
+        
         if self.debug_level > 0:
-            print("[ScanMatcher] Initialized with debug level", self.debug_level)
-            print("[ScanMatcher] ICP max iterations:", self.max_iterations)
-            print("[ScanMatcher] Using motion validation thresholds:")
-            print(f"[ScanMatcher]   - Max translation: {self.max_translation_per_frame}m")
-            print(f"[ScanMatcher]   - Max rotation: {self.max_rotation_per_frame}rad")
-            print(f"[ScanMatcher]   - Occupancy threshold: {self.occupancy_threshold}")
-            print(f"[ScanMatcher]   - Max correspondence distance: {self.max_correspondence_distance}m")
+            print("[ScanMatcher] Initialized with adaptive parameters and aggressive resampling")
+            print(f"[ScanMatcher]   - Base correspondence distance: {self.default_correspondence_distance}m (can increase to {self.max_possible_correspondence_distance}m)")
+            print(f"[ScanMatcher]   - Base occupancy threshold: {self.occupancy_threshold} (can decrease to {self.min_occupancy_threshold})")
+            print(f"[ScanMatcher]   - Base max translation: {self.max_translation_per_frame}m (can increase to {self.max_possible_translation}m)")
+            print(f"[ScanMatcher]   - Alignment reset interval: {self.reset_interval} frames (drift threshold: {self.drift_threshold}m)")
+            print(f"[ScanMatcher]   - Aggressive resampling enabled (max search radius: {self.aggressive_max_correspondence_distance}m, min threshold: {self.aggressive_min_occupancy_threshold})")
             print("\n" + "="*80)
             print("        POSE INFORMATION FOR EACH SCAN MATCH WILL BE PRINTED BELOW")
             print("="*80 + "\n")
@@ -644,7 +688,7 @@ class ImprovedScanMatchingLocalization:
             self.odometry_trajectory = [initial_pose.copy()]
         
         # Set the minimum number of frames to build the map before matching
-        map_build_frames = 25  # INCREASED from 5 to 25
+        map_build_frames = 20  # Frames dedicated to building the initial map
         
         # Process each scan
         for i, scan_data in enumerate(lidar_data):
@@ -665,27 +709,42 @@ class ImprovedScanMatchingLocalization:
                 flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
             )
             
-            # Update the map with current scan (ALWAYS update the map)
+            # Update the map with current scan
             if self.map:
-                self.map.update_grid(
-                    odometry_pose.x,  # Use odometry pose for mapping
-                    odometry_pose.y,
-                    scan_x,
-                    scan_y
-                )
+                # Check if we need to expand the map
+                if (self.should_expand_map or self.force_map_expansion) and hasattr(self.map, 'expand_grid'):
+                    self.map.expand_grid()
+                    self.should_expand_map = False
+                    self.force_map_expansion = False
+                
+                # Update the map with the current scan
+                try:
+                    self.map.update_grid(
+                        odometry_pose.x,  # Use odometry pose for mapping
+                        odometry_pose.y,
+                        scan_x,
+                        scan_y
+                    )
+                except Exception as e:
+                    print(f"\n[ScanMatcher] Warning: Error updating map: {e}")
+                    # If we get grid bounds errors, force map expansion next frame
+                    self.force_map_expansion = True
                 
                 # Track the building progress
                 self.map_build_progress = (i * 100) // map_build_frames if i <= map_build_frames else 100
                 
-                # DEBUG: Print map statistics every 5 frames
-                if i % 5 == 0 and self.debug_level > 1:
-                    occupied_cells = np.sum(self.map.grid > self.occupancy_threshold)
-                    total_cells = self.map.grid_width * self.map.grid_height
-                    print(f"\n[ScanMatcher] Map stats: Min={np.min(self.map.grid):.3f}, "
-                          f"Max={np.max(self.map.grid):.3f}, "
-                          f"Mean={np.mean(self.map.grid):.3f}, "
-                          f"Occupied={occupied_cells}/{total_cells} cells "
-                          f"({occupied_cells/total_cells*100:.2f}%)")
+                # DEBUG: Print map statistics every 10 frames
+                if i % 10 == 0 and self.debug_level > 1:
+                    try:
+                        occupied_cells = np.sum(self.map.grid > self.occupancy_threshold)
+                        total_cells = self.map.grid_width * self.map.grid_height
+                        print(f"\n[ScanMatcher] Map stats: Min={np.min(self.map.grid):.3f}, "
+                              f"Max={np.max(self.map.grid):.3f}, "
+                              f"Mean={np.mean(self.map.grid):.3f}, "
+                              f"Occupied={occupied_cells}/{total_cells} cells "
+                              f"({occupied_cells/total_cells*100:.2f}%)")
+                    except Exception as e:
+                        print(f"\n[ScanMatcher] Error calculating map stats: {e}")
             
             # Check if we've built enough of the map
             if i >= map_build_frames and not self.map_built:
@@ -694,6 +753,15 @@ class ImprovedScanMatchingLocalization:
             
             # Only perform scan matching if we have a map and have built it enough
             if self.map_built:
+                # Check if we need to reset alignment between odometry and scan matcher
+                alignment_reset = self.checkAndResetAlignment()
+                if alignment_reset:
+                    print(f"[ScanMatcher] Alignment reset performed at frame {i}")
+                    continue  # Skip this frame's scan matching
+                
+                # Now adapt parameters based on matching history
+                self.adaptParametersBasedOnMatchQuality()
+                
                 # Get the relative odometry movement since last frame
                 relative_dx = odometry_pose.x - self.odometry_trajectory[-2].x
                 relative_dy = odometry_pose.y - self.odometry_trajectory[-2].y
@@ -714,55 +782,148 @@ class ImprovedScanMatchingLocalization:
                     stage="BEFORE MATCHING"
                 )
                 
-                # Match current scan against the map using ICP
-                matched_pose, match_info = self.matchScan(scan_x, scan_y, initial_guess)
+                # Check for emergency alignment reset if drift is extreme
+                odom_guess_diff_x = odometry_pose.x - initial_guess.x
+                odom_guess_diff_y = odometry_pose.y - initial_guess.y
+                odom_guess_diff_dist = np.sqrt(odom_guess_diff_x**2 + odom_guess_diff_y**2)
                 
-                # DEBUG: Validate correspondences
-                if self.debug_level > 2:
-                    self.visualizeCorrespondences(scan_x, scan_y, matched_pose)
+                if odom_guess_diff_dist > 2.0:  # More than 2 meters difference is extreme
+                    print(f"\n[ScanMatcher] EMERGENCY: Extreme drift detected ({odom_guess_diff_dist:.2f}m). "
+                          f"Forcing immediate alignment reset.")
+                    
+                    # Create reset pose using odometry position but keeping matched orientation
+                    reset_pose = PoseEstimate(
+                        odometry_pose.x,
+                        odometry_pose.y,
+                        self.last_matched_pose.theta
+                    )
+                    
+                    # Update trajectory
+                    self.trajectory.append(reset_pose.copy())
+                    self.last_matched_pose = reset_pose
+                    
+                    # Reset counters and flags
+                    self.frames_since_last_reset = 0
+                    self.consecutive_poor_matches = 0
+                    
+                    # Skip to next frame
+                    self.match_count += 1
+                    continue
                 
-                # Validate the match - check if the movement is reasonable
-                is_valid = self.validateMatch(matched_pose, self.last_matched_pose, match_info)
-                
-                if is_valid:
-                    # Print final matched pose
+                # Check if we're in recovery mode
+                if self.in_recovery_mode:
+                    # In recovery mode, use odometry directly for a few frames
+                    self.recovery_counter += 1
+                    
+                    # Print recovery mode status
+                    print(f"\n[ScanMatcher] In recovery mode (frame {self.recovery_counter}/{self.recovery_frames})")
+                    
+                    # Create a pose that's a blend between odometry and last matched
+                    recovery_pose = self.createRecoveryPose(odometry_pose, self.last_matched_pose)
+                    match_info = {
+                        'iterations': 0,
+                        'final_score': 0.5,  # Arbitrary middle score
+                        'error': 0.0,
+                        'correspondences': 0,
+                        'resampling_attempts': 0
+                    }
+                    
+                    # Print recovery pose
                     self.print_pose_comparison(
                         match_num=self.match_count+1,
                         previous_pose=self.last_matched_pose,
                         odometry_pose=odometry_pose,
                         initial_guess=initial_guess,
-                        estimated_pose=matched_pose,
+                        estimated_pose=recovery_pose,
                         match_info=match_info,
-                        stage="AFTER MATCHING (VALID)"
+                        stage="RECOVERY MODE"
                     )
                     
-                    # Update trajectory with the matched pose
-                    self.trajectory.append(matched_pose.copy())
-                    self.last_matched_pose = matched_pose
+                    # Update trajectory with recovery pose
+                    self.trajectory.append(recovery_pose.copy())
+                    self.last_matched_pose = recovery_pose
                     
-                    if self.debug_level > 1:
-                        print(f"\n[ScanMatcher] Valid match found. Score: {match_info['final_score']:.4f}")
+                    # Exit recovery mode after enough frames
+                    if self.recovery_counter >= self.recovery_frames:
+                        self.in_recovery_mode = False
+                        self.recovery_counter = 0
+                        self.consecutive_poor_matches = 0
+                        print(f"\n[ScanMatcher] Exiting recovery mode")
                 else:
-                    # If match is invalid, use the odometry pose with small correction
-                    corrected_pose = self.applySmallCorrection(odometry_pose, self.last_matched_pose)
+                    # Normal mode - match current scan against the map using ICP
+                    matched_pose, match_info = self.matchScan(scan_x, scan_y, initial_guess)
                     
-                    # Print corrected pose 
-                    self.print_pose_comparison(
-                        match_num=self.match_count+1,
-                        previous_pose=self.last_matched_pose,
-                        odometry_pose=odometry_pose,
-                        initial_guess=initial_guess,
-                        estimated_pose=matched_pose,
-                        corrected_pose=corrected_pose,
-                        match_info=match_info,
-                        stage="AFTER MATCHING (INVALID - USING CORRECTION)"
-                    )
+                    # Check if we have the special case of resampling
+                    if match_info['resampling_attempts'] > 0:
+                        resampling_str = f"[ScanMatcher] Used aggressive resampling - {match_info['resampling_attempts']} attempts needed"
+                        if match_info['correspondences'] > 0:
+                            resampling_str += f", found {match_info['correspondences']} correspondences"
+                        print(f"\n{resampling_str}")
+                        
+                        self.frames_with_resampling += 1
+                        self.resampling_attempts += match_info['resampling_attempts']
+                        
+                    # Check for boundary issues - if many points are out of bounds, flag for map expansion
+                    if self.checkForMapBoundaryIssues(scan_x, scan_y, matched_pose):
+                        self.should_expand_map = True
+                        
+                    # Validate the match - check if the movement is reasonable
+                    is_valid = self.validateMatch(matched_pose, self.last_matched_pose, match_info)
                     
-                    self.trajectory.append(corrected_pose.copy())
-                    self.last_matched_pose = corrected_pose
+                    # Update parameters based on match quality for next frame
+                    self.adaptParametersBasedOnMatchQuality(match_info)
                     
-                    if self.debug_level > 0:
-                        print(f"\n[ScanMatcher] ⚠️ Invalid match rejected! Using odometry with correction.")
+                    if is_valid:
+                        # Reset the consecutive failures counter
+                        self.consecutive_poor_matches = 0
+                        
+                        # Print final matched pose
+                        self.print_pose_comparison(
+                            match_num=self.match_count+1,
+                            previous_pose=self.last_matched_pose,
+                            odometry_pose=odometry_pose,
+                            initial_guess=initial_guess,
+                            estimated_pose=matched_pose,
+                            match_info=match_info,
+                            stage="AFTER MATCHING (VALID)"
+                        )
+                        
+                        # Update trajectory with the matched pose
+                        self.trajectory.append(matched_pose.copy())
+                        self.last_matched_pose = matched_pose
+                        
+                        if self.debug_level > 1:
+                            print(f"\n[ScanMatcher] Valid match found. Score: {match_info['final_score']:.4f}")
+                    else:
+                        # Increment the consecutive failures counter
+                        self.consecutive_poor_matches += 1
+                        
+                        # If match is invalid, use the odometry pose with small correction
+                        corrected_pose = self.applySmallCorrection(odometry_pose, self.last_matched_pose)
+                        
+                        # Print corrected pose 
+                        self.print_pose_comparison(
+                            match_num=self.match_count+1,
+                            previous_pose=self.last_matched_pose,
+                            odometry_pose=odometry_pose,
+                            initial_guess=initial_guess,
+                            estimated_pose=matched_pose,
+                            corrected_pose=corrected_pose,
+                            match_info=match_info,
+                            stage="AFTER MATCHING (INVALID - USING CORRECTION)"
+                        )
+                        
+                        self.trajectory.append(corrected_pose.copy())
+                        self.last_matched_pose = corrected_pose
+                        
+                        # Check if we need to enter recovery mode
+                        if self.consecutive_poor_matches >= 3:
+                            print(f"\n[ScanMatcher] ⚠️ {self.consecutive_poor_matches} consecutive match failures! Entering recovery mode.")
+                            self.in_recovery_mode = True
+                            self.recovery_counter = 0
+                        else:
+                            if self.debug_level > 0:
+                                print(f"\n[ScanMatcher] ⚠️ Invalid match rejected! Using odometry with correction.")
                 
                 # Increment match count
                 self.match_count += 1
@@ -775,85 +936,233 @@ class ImprovedScanMatchingLocalization:
                 # Print the building progress
                 if i % 5 == 0:
                     print(f"\n[ScanMatcher] Building map... {self.map_build_progress}% complete")
-            
         
         if self.debug_level > 0:
             print(f"\n[ScanMatcher] Processed {len(lidar_data)} scans. Trajectory contains {len(self.trajectory)} poses.")
+            if self.frames_with_resampling > 0:
+                print(f"[ScanMatcher] Aggressive resampling was used in {self.frames_with_resampling} frames " 
+                      f"({self.frames_with_resampling/self.match_count*100:.1f}% of matches).")
+                print(f"[ScanMatcher] Average of {self.resampling_attempts/self.frames_with_resampling:.1f} " 
+                      f"resampling attempts per frame when needed.")
         return self.trajectory
     
-    def visualizeCorrespondences(self, scan_x, scan_y, pose):
-        """Debug function to visualize the correspondences"""
+    def adaptParametersBasedOnMatchQuality(self, match_info=None):
+        """
+        Adaptively adjust parameters based on recent match quality
+        
+        Args:
+            match_info: Information from the last match attempt
+        """
+        # If we have match info, add it to our history
+        if match_info is not None:
+            self.match_qualities.append({
+                'score': match_info['final_score'],
+                'correspondences': match_info['correspondences'],
+                'error': match_info['error']
+            })
+            
+            # Keep only the most recent N matches
+            if len(self.match_qualities) > self.quality_history_size:
+                self.match_qualities.pop(0)
+        
+        # If we don't have enough history yet, use default settings
+        if len(self.match_qualities) < 2:
+            return
+        
+        # Calculate the average match quality
+        avg_score = sum(q['score'] for q in self.match_qualities) / len(self.match_qualities)
+        avg_correspondences = sum(q['correspondences'] for q in self.match_qualities) / len(self.match_qualities)
+        
+        # Check if we're having matching problems
+        poor_match = avg_score < self.match_quality_threshold or avg_correspondences < 10
+        
+        # Get the most recent match result
+        last_match = self.match_qualities[-1]
+        
+        # Calculate adaptive parameter adjustments
+        if poor_match:
+            self.consecutive_poor_matches += 1
+            
+            # Adaptively increase search parameters based on consecutive poor matches
+            adjustment_factor = min(1.0, 0.2 * self.consecutive_poor_matches)  # Up to 100% adjustment
+            
+            # Increase search radius
+            self.max_correspondence_distance = min(
+                self.max_possible_correspondence_distance,
+                self.default_correspondence_distance * (1.0 + adjustment_factor)
+            )
+            
+            # Lower occupancy threshold
+            self.occupancy_threshold = max(
+                self.min_occupancy_threshold,
+                self.default_occupancy_threshold * (1.0 - adjustment_factor * 0.3)
+            )
+            
+            # Increase motion limits
+            self.max_translation_per_frame = min(
+                self.max_possible_translation,
+                self.default_max_translation * (1.0 + adjustment_factor)
+            )
+            
+            self.max_rotation_per_frame = min(
+                self.max_possible_rotation,
+                self.default_max_rotation * (1.0 + adjustment_factor * 0.5)
+            )
+            
+            if self.debug_level > 1 and self.consecutive_poor_matches > 0:
+                print(f"\n[ScanMatcher] Low match quality detected ({self.consecutive_poor_matches} consecutive). Adapting parameters:")
+                print(f"  - Correspondence distance: {self.max_correspondence_distance:.2f}m")
+                print(f"  - Occupancy threshold: {self.occupancy_threshold:.2f}")
+                print(f"  - Max translation: {self.max_translation_per_frame:.2f}m")
+        else:
+            # Good match, gradually return to default values
+            self.consecutive_poor_matches = 0
+            
+            # Gradually move back towards defaults (10% step)
+            self.max_correspondence_distance = self.max_correspondence_distance * 0.9 + self.default_correspondence_distance * 0.1
+            self.occupancy_threshold = self.occupancy_threshold * 0.9 + self.default_occupancy_threshold * 0.1
+            self.max_translation_per_frame = self.max_translation_per_frame * 0.9 + self.default_max_translation * 0.1
+            self.max_rotation_per_frame = self.max_rotation_per_frame * 0.9 + self.default_max_rotation * 0.1
+    
+    def checkAndResetAlignment(self):
+        """
+        Check alignment between odometry and scan matcher, and reset if necessary
+        
+        Returns:
+            True if alignment was reset, False otherwise
+        """
+        # Make sure we have enough data
+        if len(self.odometry_trajectory) < 2 or len(self.trajectory) < 1:
+            return False
+        
+        # Increment counter for frames since last reset
+        self.frames_since_last_reset += 1
+        
+        # Only check at specified interval
+        if self.frames_since_last_reset < self.reset_interval:
+            return False
+        
+        # Get the most recent odometry pose
+        current_odom = self.odometry_trajectory[-1]
+        
+        # Get the current scan-matched pose
+        current_matched = self.trajectory[-1]
+        
+        # Calculate drift between odometry and scan matcher
+        drift_x = current_odom.x - current_matched.x
+        drift_y = current_odom.y - current_matched.y
+        drift_dist = math.sqrt(drift_x**2 + drift_y**2)
+        
+        if self.debug_level > 0:
+            print(f"\n[ScanMatcher] Alignment check - Current drift: {drift_dist:.2f}m between odometry and scan matcher")
+        
+        # Reset alignment if drift exceeds threshold
+        if drift_dist > self.drift_threshold:
+            if self.debug_level > 0:
+                print(f"[ScanMatcher] Excessive drift detected! Odometry: ({current_odom.x:.2f}, {current_odom.y:.2f}), "
+                      f"Matched: ({current_matched.x:.2f}, {current_matched.y:.2f})")
+            
+            # Create a new pose that uses the odometry position but keeps the scan matcher's orientation
+            reset_pose = PoseEstimate(
+                current_odom.x, 
+                current_odom.y,
+                current_matched.theta  # Keep the scan matcher's orientation estimate
+            )
+            
+            # Update the last matched pose
+            self.last_matched_pose = reset_pose
+            
+            # Add to trajectory
+            self.trajectory.append(reset_pose.copy())
+            
+            # Reset the counter
+            self.frames_since_last_reset = 0
+            
+            # Reset parameters to defaults when realigning
+            self.max_correspondence_distance = self.default_correspondence_distance
+            self.occupancy_threshold = self.default_occupancy_threshold
+            self.max_translation_per_frame = self.default_max_translation
+            self.max_rotation_per_frame = self.default_max_rotation
+            
+            if self.debug_level > 0:
+                print(f"[ScanMatcher] ALIGNMENT RESET to odometry position: ({reset_pose.x:.2f}, {reset_pose.y:.2f})")
+                print(f"[ScanMatcher] Parameters reset to defaults")
+            
+            return True
+        
+        # If we performed a check but didn't reset, still reset the counter
+        self.frames_since_last_reset = 0
+        return False
+    
+    def createRecoveryPose(self, odometry_pose, last_matched_pose):
+        """
+        Create a recovery pose by blending odometry and last matched pose
+        
+        Args:
+            odometry_pose: Current odometry pose
+            last_matched_pose: Last matched pose
+            
+        Returns:
+            Recovery pose
+        """
+        # Calculate relative movement from odometry
+        if len(self.odometry_trajectory) < 2:
+            return odometry_pose.copy()
+            
+        last_odometry_pose = self.odometry_trajectory[-2]
+        relative_dx = odometry_pose.x - last_odometry_pose.x
+        relative_dy = odometry_pose.y - last_odometry_pose.y
+        relative_dtheta = odometry_pose.theta - last_odometry_pose.theta
+        
+        # Create recovery pose by using odometry movement from last matched pose
+        recovery_pose = last_matched_pose.copy()
+        recovery_pose.x += relative_dx
+        recovery_pose.y += relative_dy
+        recovery_pose.theta += relative_dtheta
+        
+        return recovery_pose
+    
+    def checkForMapBoundaryIssues(self, scan_x, scan_y, pose):
+        """
+        Check if the current scan is near map boundaries
+        
+        Args:
+            scan_x, scan_y: Scan points
+            pose: Current pose
+            
+        Returns:
+            True if map expansion is needed
+        """
+        if self.map is None:
+            return False
+            
         # Create points array from scan
         scan_points = np.column_stack((scan_x, scan_y))
         
         # Transform points to world frame
         world_points = self.transformPointsToWorld(scan_points, pose)
         
-        # Find correspondences
-        correspondences, mean_error = self.findCorrespondences(world_points)
+        # Count how many points are near the boundary
+        buffer = 2.0  # 2 meter buffer
+        boundary_points = 0
         
-        # Print detailed information
-        n_points = len(world_points)
-        n_correspondences = len(correspondences)
+        map_width = self.map.width
+        map_height = self.map.height
         
-        print(f"\n[ScanMatcher] CORRESPONDENCE DEBUG:")
-        print(f"  - Total scan points: {n_points}")
-        print(f"  - Valid correspondences found: {n_correspondences} ({n_correspondences/n_points*100:.2f}%)")
-        print(f"  - Mean error: {mean_error:.6f} meters")
+        for point in world_points:
+            # Check if point is near the boundary
+            if (abs(point[0]) >= map_width/2 - buffer or 
+                abs(point[1]) >= map_height/2 - buffer):
+                boundary_points += 1
         
-        if len(correspondences) > 0:
-            distances = [c['distance'] for c in correspondences]
-            print(f"  - Min distance: {min(distances):.6f} meters")
-            print(f"  - Max distance: {max(distances):.6f} meters")
-            print(f"  - Mean distance: {np.mean(distances):.6f} meters")
+        # If more than 20% of points are near boundary, suggest expansion
+        if boundary_points > 0.2 * len(world_points):
+            if self.debug_level > 0:
+                print(f"\n[ScanMatcher] Warning: {boundary_points} scan points ({boundary_points/len(world_points)*100:.1f}%) "
+                     f"are near map boundaries. Map expansion recommended.")
+            return True
             
-        # Optional: create a visualization
-        if self.debug_level > 2 and n_correspondences > 0:
-            import matplotlib.pyplot as plt
-            
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            # Plot the map
-            if self.map:
-                # Custom colormap
-                cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
-                bounds = [0, 0.4, 0.6, 1]
-                norm = colors.BoundaryNorm(bounds, cmap.N)
-                
-                ax.imshow(
-                    self.map.get_grid_for_display(),
-                    cmap=cmap, norm=norm,
-                    origin='lower',
-                    extent=[-self.map.width/2, self.map.width/2, -self.map.height/2, self.map.height/2]
-                )
-            
-            # Plot scan points
-            ax.scatter(world_points[:, 0], world_points[:, 1], c='blue', s=3, alpha=0.5, label='Scan Points')
-            
-            # Plot corresponding map points
-            if len(correspondences) > 0:
-                map_points = np.array([c['map_point'] for c in correspondences])
-                ax.scatter(map_points[:, 0], map_points[:, 1], c='red', s=5, label='Map Points')
-                
-                # Draw lines between correspondences (only plot a subset for clarity)
-                max_lines = min(50, len(correspondences))
-                for i in range(max_lines):
-                    idx = i * len(correspondences) // max_lines
-                    c = correspondences[idx]
-                    ax.plot([c['scan_point'][0], c['map_point'][0]], 
-                           [c['scan_point'][1], c['map_point'][1]], 
-                           'g-', alpha=0.3)
-            
-            # Plot the robot position
-            ax.scatter(pose.x, pose.y, c='purple', s=100, marker='*', label='Robot Position')
-            
-            ax.set_title(f"Correspondences Debug - {n_correspondences}/{n_points} points matched")
-            ax.legend()
-            ax.grid(True)
-            ax.set_aspect('equal')
-            
-            plt.tight_layout()
-            plt.show()
+        return False
     
     def print_pose_comparison(self, match_num, previous_pose, odometry_pose, initial_guess, 
                             estimated_pose=None, corrected_pose=None, match_info=None, stage=""):
@@ -895,6 +1204,14 @@ class ImprovedScanMatchingLocalization:
         print(f"INITIAL GUESS:    x={initial_guess.x:.4f}, y={initial_guess.y:.4f}, θ={initial_guess.theta:.4f}")
         print(f"GUESS DELTA:      Δx={guess_delta_x:.4f}, Δy={guess_delta_y:.4f}, Δθ={guess_delta_theta:.4f}")
         
+        # Calculate the difference between odometry and initial guess
+        odom_guess_diff_x = odometry_pose.x - initial_guess.x
+        odom_guess_diff_y = odometry_pose.y - initial_guess.y
+        odom_guess_diff_dist = np.sqrt(odom_guess_diff_x**2 + odom_guess_diff_y**2)
+        
+        # Print the difference
+        print(f"ODOM-GUESS DIFF:  Δx={odom_guess_diff_x:.4f}, Δy={odom_guess_diff_y:.4f}, dist={odom_guess_diff_dist:.4f}")
+        
         # Print estimated pose if available
         if estimated_pose:
             est_delta_x = estimated_pose.x - previous_pose.x
@@ -906,8 +1223,14 @@ class ImprovedScanMatchingLocalization:
             
             # Print match info if available
             if match_info:
-                print(f"MATCH INFO:       Score={match_info['final_score']:.4f}, Iterations={match_info['iterations']}, "
-                      f"Error={match_info['error']:.6f}, Correspondences={match_info['correspondences']}")
+                # Include resampling info
+                if match_info.get('resampling_attempts', 0) > 0:
+                    print(f"MATCH INFO:       Score={match_info['final_score']:.4f}, Iterations={match_info['iterations']}, "
+                          f"Error={match_info['error']:.6f}, Correspondences={match_info['correspondences']}, "
+                          f"Resampling Attempts={match_info['resampling_attempts']}")
+                else:
+                    print(f"MATCH INFO:       Score={match_info['final_score']:.4f}, Iterations={match_info['iterations']}, "
+                          f"Error={match_info['error']:.6f}, Correspondences={match_info['correspondences']}")
         
         # Print corrected pose if available
         if corrected_pose:
@@ -926,7 +1249,7 @@ class ImprovedScanMatchingLocalization:
     
     def matchScan(self, scan_x, scan_y, initial_pose):
         """
-        Match the current scan against the map using ICP algorithm
+        Match the current scan against the map using ICP algorithm with aggressive resampling
         
         Args:
             scan_x: List of scan x coordinates
@@ -939,41 +1262,81 @@ class ImprovedScanMatchingLocalization:
         # Create points array from scan
         scan_points = np.column_stack((scan_x, scan_y))
         
-        # Initialize transformation from initial pose
-        current_pose = initial_pose.copy()
-        prev_error = float('inf')
+        # Transform scan points to world frame using initial pose
+        transformed_points = self.transformPointsToWorld(scan_points, initial_pose)
         
-        # For visualization
+        # Try with normal parameters first
+        current_pose = initial_pose.copy()
+        correspondences, mean_error = self.findCorrespondences(transformed_points)
+        
+        # If we don't have enough correspondences, use aggressive resampling
+        resampling_attempts = 0
+        original_max_correspondence_distance = self.max_correspondence_distance
+        original_occupancy_threshold = self.occupancy_threshold
+        
+        if len(correspondences) < 5:
+            if self.debug_level > 1:
+                print(f"\n[ScanMatcher] Only {len(correspondences)} correspondences found initially. Starting aggressive resampling.")
+            
+            # Gradually increase search parameters until we find enough correspondences
+            for attempt in range(1, self.aggressive_max_resampling_attempts + 1):
+                resampling_attempts += 1
+                
+                # Calculate more aggressive parameters based on attempt number
+                progress = attempt / self.aggressive_max_resampling_attempts
+                
+                # Increase search radius dramatically
+                search_radius = self.max_correspondence_distance + progress * (self.aggressive_max_correspondence_distance - self.max_correspondence_distance)
+                
+                # Lower occupancy threshold dramatically
+                occupancy_threshold = self.occupancy_threshold - progress * (self.occupancy_threshold - self.aggressive_min_occupancy_threshold)
+                
+                if self.debug_level > 1:
+                    print(f"[ScanMatcher] Resampling attempt {attempt}: search radius={search_radius:.2f}m, "
+                          f"occupancy threshold={occupancy_threshold:.2f}")
+                
+                # Temporarily set the new parameters
+                self.max_correspondence_distance = search_radius
+                self.occupancy_threshold = occupancy_threshold
+                
+                # Try to find correspondences with these more aggressive parameters
+                correspondences, mean_error = self.findCorrespondences(transformed_points)
+                
+                if len(correspondences) >= 5:
+                    if self.debug_level > 1:
+                        print(f"[ScanMatcher] Found {len(correspondences)} correspondences after {attempt} resampling attempts.")
+                    break
+            
+            # Restore original parameters
+            self.max_correspondence_distance = original_max_correspondence_distance
+            self.occupancy_threshold = original_occupancy_threshold
+        
+        # If we still don't have enough correspondences, use the initial pose
+        if len(correspondences) < 5:
+            if self.debug_level > 0:
+                print(f"\n[ScanMatcher] Warning: Still only found {len(correspondences)} correspondences "
+                      f"after {resampling_attempts} resampling attempts.")
+            
+            # Use initial pose but flag it as a poor match
+            return initial_pose.copy(), {
+                'iterations': 0,
+                'final_score': 0.3,  # Low score to indicate it's not a good match
+                'error': float('inf'),
+                'correspondences': len(correspondences),
+                'resampling_attempts': resampling_attempts
+            }
+        
+        # Now proceed with ICP using the found correspondences
         iterations_data = []
+        prev_error = mean_error
         
         # Main ICP loop
         for iteration in range(self.max_iterations):
-            # Transform scan points to world frame using current pose
-            transformed_points = self.transformPointsToWorld(scan_points, current_pose)
-            
-            # Find correspondences between scan points and map
-            correspondences, mean_error = self.findCorrespondences(transformed_points)
-            
-            # Debug print for correspondences
-            if self.debug_level > 2 and iteration == 0:
-                n_points = len(transformed_points)
-                n_correspondences = len(correspondences)
-                print(f"\n[ScanMatcher] Iteration {iteration}: Found {n_correspondences}/{n_points} "
-                      f"correspondences ({n_correspondences/max(1,n_points)*100:.1f}%)")
-            
-            if len(correspondences) < 5:  # Not enough correspondences
-                if self.debug_level > 1:
-                    print(f"\n[ScanMatcher] Warning: Only {len(correspondences)} correspondences found in iteration {iteration+1}.")
-                break
-            
             # Store the current pose before updating
             prev_pose = current_pose.copy()
             
             # Estimate new transformation that minimizes the distance between corresponding points
             updated_pose = self.estimateTransformation(scan_points, correspondences, current_pose)
-            
-            # Calculate the change in pose
-            pose_change = self.calculatePoseChange(current_pose, updated_pose)
             
             # Store iteration data for visualization
             iterations_data.append({
@@ -987,6 +1350,18 @@ class ImprovedScanMatchingLocalization:
             # Update current pose
             current_pose = updated_pose
             
+            # Transform scan points to world frame using the updated pose
+            transformed_points = self.transformPointsToWorld(scan_points, current_pose)
+            
+            # Find new correspondences
+            correspondences, mean_error = self.findCorrespondences(transformed_points)
+            
+            # If we lost too many correspondences, stop
+            if len(correspondences) < 5:
+                if self.debug_level > 1:
+                    print(f"\n[ScanMatcher] Lost correspondences during ICP (down to {len(correspondences)}). Stopping.")
+                break
+            
             # Check for convergence
             if abs(prev_error - mean_error) < self.convergence_threshold:
                 if self.debug_level > 2:
@@ -995,7 +1370,7 @@ class ImprovedScanMatchingLocalization:
                 
             prev_error = mean_error
         
-        # Score the final match - FIXED to handle cases with no valid points
+        # Score the final match
         final_score = self.scoreFinalMatch(scan_points, current_pose)
         
         # Store visualization data
@@ -1004,7 +1379,8 @@ class ImprovedScanMatchingLocalization:
             'final_pose': current_pose,
             'initial_pose': initial_pose,
             'scan_points': scan_points,
-            'final_score': final_score
+            'final_score': final_score,
+            'resampling_attempts': resampling_attempts
         }
         
         # Return the matched pose and match information
@@ -1012,7 +1388,8 @@ class ImprovedScanMatchingLocalization:
             'iterations': len(iterations_data),
             'final_score': final_score,
             'error': prev_error,
-            'correspondences': len(correspondences) if correspondences is not None else 0
+            'correspondences': len(correspondences),
+            'resampling_attempts': resampling_attempts
         }
         
         return current_pose, match_info
@@ -1070,6 +1447,10 @@ class ImprovedScanMatchingLocalization:
             # Convert to grid coordinates
             grid_x, grid_y = self.map.world_to_grid(point[0], point[1])
             
+            # Make sure the grid coordinates are valid
+            if not (0 <= grid_x < self.map.grid_width and 0 <= grid_y < self.map.grid_height):
+                continue
+                
             # Find closest occupied cell within search radius
             closest_cell, distance = self.findClosestOccupiedCell(grid_x, grid_y)
             
@@ -1113,7 +1494,7 @@ class ImprovedScanMatchingLocalization:
                 
                 # Check if within grid bounds
                 if (0 <= nx < self.map.grid_width and 0 <= ny < self.map.grid_height):
-                    # Check if this cell is occupied - USING LOWER THRESHOLD
+                    # Check if this cell is occupied - USING CURRENT THRESHOLD
                     if self.map.grid[ny, nx] > self.occupancy_threshold:
                         # Calculate Euclidean distance
                         distance = math.sqrt(dx**2 + dy**2)
@@ -1271,10 +1652,15 @@ class ImprovedScanMatchingLocalization:
         Returns:
             Boolean indicating if the match is valid
         """
+        # If there were resampling attempts but still few correspondences, be stricter
+        min_required_correspondences = 5
+        if match_info['resampling_attempts'] > 0:
+            min_required_correspondences = 3 + match_info['resampling_attempts']
+            
         # If no correspondences were found, match is invalid
-        if match_info['correspondences'] < 5:
+        if match_info['correspondences'] < min_required_correspondences:
             if self.debug_level > 1:
-                print(f"\n[ScanMatcher] Match rejected: Too few correspondences ({match_info['correspondences']} < 5)")
+                print(f"\n[ScanMatcher] Match rejected: Too few correspondences ({match_info['correspondences']} < {min_required_correspondences})")
             return False
         
         # Calculate pose change
@@ -1292,10 +1678,14 @@ class ImprovedScanMatchingLocalization:
                 print(f"\n[ScanMatcher] Match rejected: Rotation too large ({abs(pose_change['dtheta']):.3f}rad > {self.max_rotation_per_frame}rad)")
             return False
         
-        # Check if the match score is reasonable
-        if match_info['final_score'] < 0.3:  # Threshold for a "good" match
+        # Check if the match score is reasonable - be more lenient if we had to resample
+        score_threshold = 0.3
+        if match_info['resampling_attempts'] > 0:
+            score_threshold = max(0.2, 0.3 - 0.02 * match_info['resampling_attempts'])
+            
+        if match_info['final_score'] < score_threshold:
             if self.debug_level > 1:
-                print(f"\n[ScanMatcher] Match rejected: Score too low ({match_info['final_score']:.3f} < 0.3)")
+                print(f"\n[ScanMatcher] Match rejected: Score too low ({match_info['final_score']:.3f} < {score_threshold})")
             return False
         
         # All checks passed
@@ -1363,6 +1753,12 @@ class ImprovedScanMatchingLocalization:
                 origin='lower',
                 extent=[-self.map.width/2, self.map.width/2, -self.map.height/2, self.map.height/2]
             )
+            
+            # Draw map boundaries
+            ax.axhline(y=-self.map.height/2, color='red', linestyle='--', alpha=0.5)
+            ax.axhline(y=self.map.height/2, color='red', linestyle='--', alpha=0.5)
+            ax.axvline(x=-self.map.width/2, color='red', linestyle='--', alpha=0.5)
+            ax.axvline(x=self.map.width/2, color='red', linestyle='--', alpha=0.5)
         
         # Plot the transformed scan points
         ax.scatter(transformed_points[:, 0], transformed_points[:, 1], c='red', s=3, label='Scan Points')
@@ -1379,6 +1775,12 @@ class ImprovedScanMatchingLocalization:
             pose.x, pose.y, dx, dy,
             head_width=0.1, head_length=0.1, fc='blue', ec='blue'
         )
+        
+        # Plot search radius circle to visualize correspondence distance
+        search_circle = plt.Circle((pose.x, pose.y), 
+                                  self.max_correspondence_distance,
+                                  color='blue', fill=False, alpha=0.3)
+        ax.add_patch(search_circle)
         
         # If we have visualization data and want to show iterations
         if show_iterations and self.current_visualization_data:
@@ -1408,11 +1810,23 @@ class ImprovedScanMatchingLocalization:
                 # Add a custom legend entry for iterations
                 ax.scatter([], [], c='green', marker='x', s=50, label='ICP Iterations')
             
-            # Add match score to the plot
-            score_text = f"Match Score: {data['final_score']:.3f}"
-            ax.text(0.02, 0.98, score_text, transform=ax.transAxes, 
+            # Add match score and resampling info to the plot
+            info_text = f"Match Score: {data['final_score']:.3f}"
+            if data.get('resampling_attempts', 0) > 0:
+                info_text += f"\nResampling Attempts: {data['resampling_attempts']}"
+                
+            ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
                     va='top', ha='left', color='blue', fontsize=10,
                     bbox=dict(facecolor='white', alpha=0.7))
+            
+            # If aggressive resampling was used, also show the aggressive search radius
+            if data.get('resampling_attempts', 0) > 0:
+                aggressive_circle = plt.Circle((pose.x, pose.y), 
+                                            self.aggressive_max_correspondence_distance,
+                                            color='red', fill=False, alpha=0.2, linestyle='--')
+                ax.add_patch(aggressive_circle)
+                ax.scatter([], [], c='red', marker='o', s=0, label=f'Aggressive Search ({self.aggressive_max_correspondence_distance}m)', 
+                          linestyle='--', alpha=0.2)
         
         # Add grid and labels
         ax.grid(True)
@@ -1483,7 +1897,29 @@ class ImprovedScanMatchingLocalization:
             label='Initial Points'
         )
         
-        axes[0].set_title("Initial State")
+        # Show search radius
+        search_circle = plt.Circle(
+            (data['initial_pose'].x, data['initial_pose'].y), 
+            self.max_correspondence_distance,
+            color='blue', fill=False, alpha=0.3
+        )
+        axes[0].add_patch(search_circle)
+        
+        # If resampling was used, show that info
+        if data.get('resampling_attempts', 0) > 0:
+            info_text = f"Initial State\nResampling: {data['resampling_attempts']} attempts"
+            
+            # Also show aggressive search radius
+            aggressive_circle = plt.Circle(
+                (data['initial_pose'].x, data['initial_pose'].y), 
+                self.aggressive_max_correspondence_distance,
+                color='red', fill=False, alpha=0.2, linestyle='--'
+            )
+            axes[0].add_patch(aggressive_circle)
+        else:
+            info_text = "Initial State"
+            
+        axes[0].set_title(info_text)
         axes[0].legend()
         
         # Plot iteration states
@@ -1539,6 +1975,186 @@ class ImprovedScanMatchingLocalization:
         
         plt.tight_layout()
         return fig
+
+    def visualize_map_and_scan(self, scan_x, scan_y, pose):
+        """Create a visualization of the map and current scan for debugging"""
+        import matplotlib.pyplot as plt
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Create points array from scan
+        scan_points = np.column_stack((scan_x, scan_y))
+        
+        # Transform points to world frame
+        world_points = self.transformPointsToWorld(scan_points, pose)
+        
+        # Plot the map
+        if self.map:
+            # Custom colormap
+            cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+            bounds = [0, 0.4, 0.6, 1]
+            norm = colors.BoundaryNorm(bounds, cmap.N)
+            
+            ax.imshow(
+                self.map.get_grid_for_display(),
+                cmap=cmap, norm=norm,
+                origin='lower',
+                extent=[-self.map.width/2, self.map.width/2, -self.map.height/2, self.map.height/2]
+            )
+            
+            # Count the number of occupied cells
+            try:
+                occupied_cells = np.sum(self.map.grid > self.occupancy_threshold)
+                total_cells = self.map.grid_width * self.map.grid_height
+                
+                ax.set_title(f"Map Visualization - {occupied_cells} occupied cells ({occupied_cells/total_cells*100:.2f}%)")
+            except:
+                ax.set_title("Map Visualization")
+        
+        # Plot odometry trajectory
+        odom_x = [pose.x for pose in self.odometry_trajectory]
+        odom_y = [pose.y for pose in self.odometry_trajectory]
+        ax.plot(odom_x, odom_y, 'r-', linewidth=1, alpha=0.5, label='Odometry')
+        
+        # Plot matched trajectory
+        matched_x = [pose.x for pose in self.trajectory]
+        matched_y = [pose.y for pose in self.trajectory]
+        ax.plot(matched_x, matched_y, 'g-', linewidth=1, label='Matched')
+        
+        # Plot scan points
+        ax.scatter(world_points[:, 0], world_points[:, 1], c='blue', s=3, alpha=0.5, label='Current Scan')
+        
+        # Plot the current position from both odometry and matched pose
+        if len(self.odometry_trajectory) > 0:
+            ax.scatter(self.odometry_trajectory[-1].x, self.odometry_trajectory[-1].y, 
+                      c='red', s=100, marker='*', label='Odometry Position')
+        
+        if len(self.trajectory) > 0:
+            ax.scatter(self.trajectory[-1].x, self.trajectory[-1].y, 
+                      c='green', s=100, marker='*', label='Matched Position')
+        
+        # Draw map boundaries
+        ax.axhline(y=-self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axhline(y=self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=-self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        
+        # Add search radius visualization around current matched position
+        if len(self.trajectory) > 0:
+            current_pos = self.trajectory[-1]
+            search_circle = plt.Circle((current_pos.x, current_pos.y), 
+                                      self.max_correspondence_distance,
+                                      color='blue', fill=False, alpha=0.3)
+            ax.add_patch(search_circle)
+            
+            # Also show the aggressive search radius
+            aggressive_circle = plt.Circle((current_pos.x, current_pos.y), 
+                                        self.aggressive_max_correspondence_distance,
+                                        color='red', fill=False, alpha=0.2, linestyle='--')
+            ax.add_patch(aggressive_circle)
+        
+        ax.legend()
+        ax.grid(True)
+        ax.set_aspect('equal')
+        
+        plt.tight_layout()
+        
+        # Save the figure to a file
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        plt.savefig(f"map_scan_debug_{timestamp}.png", dpi=150)
+        
+        print(f"\n[ScanMatcher] Map visualization saved to map_scan_debug_{timestamp}.png")
+        
+        # Close the figure to free memory
+        plt.close(fig)
+
+    def visualize_map_and_scan(self, scan_x, scan_y, pose):
+        """Create a visualization of the map and current scan for debugging"""
+        import matplotlib.pyplot as plt
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Create points array from scan
+        scan_points = np.column_stack((scan_x, scan_y))
+        
+        # Transform points to world frame
+        world_points = self.transformPointsToWorld(scan_points, pose)
+        
+        # Plot the map
+        if self.map:
+            # Custom colormap
+            cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+            bounds = [0, 0.4, 0.6, 1]
+            norm = colors.BoundaryNorm(bounds, cmap.N)
+            
+            ax.imshow(
+                self.map.get_grid_for_display(),
+                cmap=cmap, norm=norm,
+                origin='lower',
+                extent=[-self.map.width/2, self.map.width/2, -self.map.height/2, self.map.height/2]
+            )
+            
+            # Count the number of occupied cells
+            try:
+                occupied_cells = np.sum(self.map.grid > self.occupancy_threshold)
+                total_cells = self.map.grid_width * self.map.grid_height
+                
+                ax.set_title(f"Map Visualization - {occupied_cells} occupied cells ({occupied_cells/total_cells*100:.2f}%)")
+            except:
+                ax.set_title("Map Visualization")
+        
+        # Plot odometry trajectory
+        odom_x = [pose.x for pose in self.odometry_trajectory]
+        odom_y = [pose.y for pose in self.odometry_trajectory]
+        ax.plot(odom_x, odom_y, 'r-', linewidth=1, alpha=0.5, label='Odometry')
+        
+        # Plot matched trajectory
+        matched_x = [pose.x for pose in self.trajectory]
+        matched_y = [pose.y for pose in self.trajectory]
+        ax.plot(matched_x, matched_y, 'g-', linewidth=1, label='Matched')
+        
+        # Plot scan points
+        ax.scatter(world_points[:, 0], world_points[:, 1], c='blue', s=3, alpha=0.5, label='Current Scan')
+        
+        # Plot the current position from both odometry and matched pose
+        if len(self.odometry_trajectory) > 0:
+            ax.scatter(self.odometry_trajectory[-1].x, self.odometry_trajectory[-1].y, 
+                      c='red', s=100, marker='*', label='Odometry Position')
+        
+        if len(self.trajectory) > 0:
+            ax.scatter(self.trajectory[-1].x, self.trajectory[-1].y, 
+                      c='green', s=100, marker='*', label='Matched Position')
+        
+        # Draw map boundaries
+        ax.axhline(y=-self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axhline(y=self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=-self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        
+        # Add search radius visualization around current matched position
+        if len(self.trajectory) > 0:
+            current_pos = self.trajectory[-1]
+            search_circle = plt.Circle((current_pos.x, current_pos.y), 
+                                      self.max_correspondence_distance,
+                                      color='blue', fill=False, alpha=0.3)
+            ax.add_patch(search_circle)
+        
+        ax.legend()
+        ax.grid(True)
+        ax.set_aspect('equal')
+        
+        plt.tight_layout()
+        
+        # Save the figure to a file
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        plt.savefig(f"map_scan_debug_{timestamp}.png", dpi=150)
+        
+        print(f"\n[ScanMatcher] Map visualization saved to map_scan_debug_{timestamp}.png")
+        
+        # Close the figure to free memory
+        plt.close(fig)
     
 def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False, 
                       show_occupancy_grid=True, grid_resolution=0.05, save_grid=False,
@@ -2445,7 +3061,7 @@ def main():
     # Add arguments
     parser.add_argument('--file', type=str, default="./lidar_slam/dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=338,
+    parser.add_argument('--max_entries', type=int, default=1400,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
