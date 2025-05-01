@@ -184,12 +184,16 @@ class PoseEstimator:
         self.alpha4 = 0.1  # Translational error from rotational motion
         
         # Scan matching parameters
-        self.scan_match_noise = np.diag([0.05, 0.05, 0.02])  # x, y, theta in meters/radians
+        self.scan_match_base_noise = np.diag([0.05, 0.05, 0.02])  # x, y, theta in meters/radians
         
         # Debug information
         self.last_odom_update = None
         self.last_scan_match_result = None
         self.last_scan_match_covariance = None
+        
+        # Confidence tracking for scan matching
+        self.scan_match_confidence_history = []
+        self.min_confidence_threshold = 0.1  # Minimum confidence to consider a match valid
     
     def update_from_odometry(self, delta_x, delta_y, delta_theta):
         """
@@ -262,8 +266,15 @@ class PoseEstimator:
         
         # Calculate motion noise
         trans = math.sqrt(delta_x_world**2 + delta_y_world**2)
-        rot1 = math.atan2(delta_y, delta_x)
-        rot2 = delta_theta - rot1
+        
+        # Calculate motion angles for noise model
+        if abs(trans) > 1e-5:
+            rot1 = math.atan2(delta_y, delta_x)
+            rot2 = delta_theta - rot1
+        else:
+            # Near-zero motion case
+            rot1 = 0
+            rot2 = 0
         
         # Noise variances based on motion model
         sigma_rot1 = self.alpha1 * abs(rot1) + self.alpha2 * trans
@@ -307,115 +318,123 @@ class PoseEstimator:
         Update pose using scan matching result
         
         Args:
-            scan_match_result: Result from scan matcher with transformation
+            scan_match_result: Result from scan matcher (tuple with corrected pose and confidence)
             reliability_weight (float): Weight for scan matching vs odometry (0-1)
             
         Returns:
             Pose2D: Updated pose
         """
+        # Parse the scan match result - now expecting (matched_pose, confidence) tuple
+        if isinstance(scan_match_result, tuple) and len(scan_match_result) == 2:
+            matched_pose, confidence = scan_match_result
+        else:
+            # For backward compatibility
+            matched_pose = scan_match_result
+            confidence = getattr(scan_match_result, 'fitness_score', 0.5)
+        
         # Store for debugging
-        self.last_scan_match_result = scan_match_result
+        self.last_scan_match_result = matched_pose
+        self.scan_match_confidence_history.append(confidence)
         
         # Check if the match was successful and reliable
-        if not scan_match_result.success or not scan_match_result.is_reliable():
-            # If scan matching failed, keep the current pose
+        if confidence < self.min_confidence_threshold:
+            # If scan matching result is not reliable, keep the current pose
             return self.current_pose.copy()
         
-        # Extract transformation
-        tx, ty = scan_match_result.translation
-        theta = scan_match_result.rotation
+        # Convert dictionary pose to Pose2D if needed
+        if isinstance(matched_pose, dict):
+            scan_match_pose = Pose2D.from_dict(matched_pose)
+        else:
+            scan_match_pose = matched_pose
         
         # Calculate covariance based on matching quality
-        # Higher fitness score -> lower uncertainty
-        uncertainty_scale = 1.0 - min(1.0, scan_match_result.fitness_score)
-        pos_variance = 0.05 + uncertainty_scale * 0.2  # meters
-        rot_variance = 0.02 + uncertainty_scale * 0.1  # radians
+        # Higher confidence -> lower uncertainty
+        uncertainty_scale = 1.0 - min(0.95, confidence)  # Cap at 0.95 to ensure some minimum uncertainty
+        pos_variance = 0.02 + uncertainty_scale * 0.2  # meters (min 0.02, max 0.22)
+        rot_variance = 0.01 + uncertainty_scale * 0.1  # radians (min 0.01, max 0.11)
         
         scan_match_covariance = np.diag([pos_variance, pos_variance, rot_variance])
         self.last_scan_match_covariance = scan_match_covariance
         
         # Handle different update methods
         if self.method == PoseEstimationMethod.SCAN_MATCH_ONLY:
-            # Apply the transformation directly to the current pose
-            transform_matrix = scan_match_result.get_transform_matrix()
-            self.current_pose = self.current_pose.apply_transform(transform_matrix)
+            # Directly use the scan match result
+            self.current_pose = scan_match_pose
             self.pose_history.append(self.current_pose.copy())
             
         elif self.method == PoseEstimationMethod.WEIGHTED_AVERAGE:
             # Simple weighted average between odometry and scan matching
-            transform_matrix = scan_match_result.get_transform_matrix()
-            scan_match_pose = self.current_pose.apply_transform(transform_matrix)
-            
             # Get the last odometry-based pose (should be current_pose)
             odom_pose = self.current_pose
             
+            # Adjust reliability weight based on confidence
+            adjusted_weight = reliability_weight * confidence
+            
             # Weighted average (linear interpolation)
-            avg_x = odom_pose.x * (1 - reliability_weight) + scan_match_pose.x * reliability_weight
-            avg_y = odom_pose.y * (1 - reliability_weight) + scan_match_pose.y * reliability_weight
+            avg_x = odom_pose.x * (1 - adjusted_weight) + scan_match_pose.x * adjusted_weight
+            avg_y = odom_pose.y * (1 - adjusted_weight) + scan_match_pose.y * adjusted_weight
             
             # For angles, we need to handle wrapping
             delta_theta = scan_match_pose.theta - odom_pose.theta
             # Normalize to [-pi, pi]
             delta_theta = ((delta_theta + math.pi) % (2 * math.pi)) - math.pi
-            avg_theta = odom_pose.theta + delta_theta * reliability_weight
+            avg_theta = odom_pose.theta + delta_theta * adjusted_weight
             
             # Update the pose
             self.current_pose = Pose2D(avg_x, avg_y, avg_theta)
             self.pose_history.append(self.current_pose.copy())
             
         elif self.method == PoseEstimationMethod.EKF_FUSION:
+            # Create relative transform from EKF prediction to scan match
+            rel_dx = scan_match_pose.x - self.current_pose.x
+            rel_dy = scan_match_pose.y - self.current_pose.y
+            rel_dtheta = scan_match_pose.theta - self.current_pose.theta
+            
+            # Normalize angle difference
+            rel_dtheta = ((rel_dtheta + math.pi) % (2 * math.pi)) - math.pi
+            
             # EKF update using scan matching as measurement
-            self._ekf_update(tx, ty, theta, scan_match_covariance)
+            self._ekf_update(rel_dx, rel_dy, rel_dtheta, scan_match_covariance, confidence)
         
         return self.current_pose.copy()
     
-    def _ekf_update(self, tx, ty, theta, measurement_cov):
+    def _ekf_update(self, dx, dy, dtheta, measurement_cov, confidence):
         """
         EKF update step using scan matching result
         
         Args:
-            tx (float): X translation from scan matching
-            ty (float): Y translation from scan matching
-            theta (float): Rotation from scan matching
+            dx (float): X translation from scan matching
+            dy (float): Y translation from scan matching
+            dtheta (float): Rotation from scan matching
             measurement_cov (np.ndarray): Measurement covariance matrix
+            confidence (float): Confidence in the scan matching result (0-1)
         """
         # Current state and covariance
         predicted_pose = self.current_pose_with_cov.pose
         P = self.current_pose_with_cov.covariance
         
         # Create measurement from scan matching (relative transformation)
-        z = np.array([tx, ty, theta])
+        z = np.array([dx, dy, dtheta])
         
         # Measurement matrix (identity for direct measurements)
         H = np.eye(3)
         
-        # Measurement covariance
-        R = measurement_cov
+        # Adjust measurement covariance based on confidence
+        confidence_factor = max(0.1, confidence)  # Ensure minimum factor
+        R = measurement_cov / confidence_factor  # Lower covariance for higher confidence
         
         # Calculate Kalman gain
         S = np.dot(np.dot(H, P), H.T) + R
-        K = np.dot(np.dot(P, H.T), np.linalg.inv(S))
-        
-        # Apply scan match transformation to predicted pose
-        transform_matrix = np.eye(3)
-        transform_matrix[0, 2] = tx
-        transform_matrix[1, 2] = ty
-        cos_theta, sin_theta = math.cos(theta), math.sin(theta)
-        transform_matrix[0, 0] = cos_theta
-        transform_matrix[0, 1] = -sin_theta
-        transform_matrix[1, 0] = sin_theta
-        transform_matrix[1, 1] = cos_theta
-        
-        scan_match_update = predicted_pose.apply_transform(transform_matrix)
-        
-        # Create expected measurement (zero for perfect match)
-        expected_z = np.zeros(3)
+        try:
+            S_inv = np.linalg.inv(S)
+            K = np.dot(np.dot(P, H.T), S_inv)
+        except np.linalg.LinAlgError:
+            # Handle numerical issues - fall back to simple update
+            print("Warning: Matrix inversion failed in EKF update. Using simplified update.")
+            K = np.eye(3) * 0.5  # Simplified gain
         
         # Innovation (difference between measurement and prediction)
-        innovation = z - expected_z
-        
-        # Normalize angle difference
-        innovation[2] = ((innovation[2] + math.pi) % (2 * math.pi)) - math.pi
+        innovation = z
         
         # Update state
         update = np.dot(K, innovation)
@@ -449,6 +468,10 @@ class PoseEstimator:
         """Get the history of poses"""
         return [pose.copy() for pose in self.pose_history]
     
+    def get_confidence_history(self):
+        """Get the history of scan matching confidence values"""
+        return self.scan_match_confidence_history.copy()
+    
     def reset(self, initial_pose=None):
         """
         Reset the estimator to initial state
@@ -462,42 +485,4 @@ class PoseEstimator:
         self.last_odom_update = None
         self.last_scan_match_result = None
         self.last_scan_match_covariance = None
-
-
-# Example usage
-if __name__ == "__main__":
-    # Create a pose estimator
-    estimator = PoseEstimator(method=PoseEstimationMethod.EKF_FUSION)
-    
-    # Simulate some odometry updates
-    estimator.update_from_odometry(0.1, 0, 0)  # Move forward 0.1m
-    estimator.update_from_odometry(0.1, 0, math.radians(5))  # Move forward and turn
-    
-    print("Current pose after odometry:", estimator.get_current_pose())
-    
-    # Simulate a scan match result (mock object)
-    class MockScanMatchResult:
-        def __init__(self):
-            self.success = True
-            self.transform_matrix = np.array([
-                [math.cos(math.radians(2)), -math.sin(math.radians(2)), 0.19],
-                [math.sin(math.radians(2)), math.cos(math.radians(2)), 0.01],
-                [0, 0, 1]
-            ])
-            self.translation = (0.19, 0.01)
-            self.rotation = math.radians(2)
-            self.fitness_score = 0.85
-            self.inlier_rmse = 0.05
-        
-        def is_reliable(self):
-            return True
-            
-        def get_transform_matrix(self):
-            return self.transform_matrix
-    
-    # Update from scan match
-    mock_result = MockScanMatchResult()
-    estimator.update_from_scan_match(mock_result)
-    
-    print("Current pose after scan match:", estimator.get_current_pose())
-    print("Current pose with covariance:", estimator.get_current_pose_with_covariance())
+        self.scan_match_confidence_history = []
