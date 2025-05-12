@@ -29,16 +29,18 @@ class SLAMMode(Enum):
 class SLAMCoordinator:
     """Class to coordinate the full SLAM pipeline"""
     
-    def __init__(self, mode=SLAMMode.SCAN_MATCHING, grid_resolution=0.05):
+    def __init__(self, mode=SLAMMode.SCAN_MATCHING, grid_resolution=0.05, use_enhanced_grid=True):
         """
         Initialize the SLAM coordinator
         
         Args:
             mode (SLAMMode): Operation mode for SLAM
             grid_resolution (float): Resolution of the occupancy grid in meters
+            use_enhanced_grid (bool): Whether to use enhanced occupancy grid features
         """
         self.mode = mode
         self.grid_resolution = grid_resolution
+        self.use_enhanced_grid = use_enhanced_grid
         
         # Occupancy grid will be initialized when first scan is processed
         self.occupancy_grid = None
@@ -85,6 +87,20 @@ class SLAMCoordinator:
             'reverse_scan': True,
             'flip_theta': False
         }
+        
+        # Enhanced grid parameters (default values)
+        self.enhanced_grid_params = {
+            'expansion_factor': 1.5,
+            'sensor_noise_variance': 0.01,
+            'turn_detection_threshold': 0.001,
+            'max_angle_of_incidence': 80,
+            'motion_compensation': True
+        }
+        
+        # Turn detection tracking
+        self.is_turning = False
+        self.turn_rate = 0.0
+        self.turn_rates = []  # Store all turn rates for analysis
     
     def set_scan_config(self, config):
         """
@@ -130,6 +146,13 @@ class SLAMCoordinator:
                 field_of_view=self.angle_max - self.angle_min,
                 num_samples=num_samples
             )
+            
+            # Configure enhanced grid parameters if using enhanced grid
+            if self.use_enhanced_grid and hasattr(self.occupancy_grid, 'turn_detection_threshold'):
+                # Update the enhanced grid parameters
+                for param, value in self.enhanced_grid_params.items():
+                    if hasattr(self.occupancy_grid, param):
+                        setattr(self.occupancy_grid, param, value)
     
     def process_scan(self, parsed_data):
         """
@@ -162,13 +185,35 @@ class SLAMCoordinator:
             grid_width = (grid_width // 2) * 2
             grid_height = (grid_height // 2) * 2
             
-            # Create the occupancy grid
-            self.occupancy_grid = occupancy_grid.OccupancyGrid(
-                resolution=self.grid_resolution,
-                width=grid_width * self.grid_resolution,
-                height=grid_height * self.grid_resolution,
-                init_position=raw_pose  # Store initial position in metadata
-            )
+            # Create the occupancy grid with enhanced parameters if enabled
+            if self.use_enhanced_grid:
+                try:
+                    self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                        resolution=self.grid_resolution,
+                        width=grid_width * self.grid_resolution,
+                        height=grid_height * self.grid_resolution,
+                        init_position=raw_pose,  # Store initial position in metadata
+                        expansion_factor=self.enhanced_grid_params['expansion_factor'],
+                        sensor_noise_variance=self.enhanced_grid_params['sensor_noise_variance']
+                    )
+                except TypeError:
+                    # Fall back to basic initialization if enhanced params aren't supported
+                    print("Warning: Enhanced grid parameters not supported. Using basic grid.")
+                    self.use_enhanced_grid = False
+                    self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                        resolution=self.grid_resolution,
+                        width=grid_width * self.grid_resolution,
+                        height=grid_height * self.grid_resolution,
+                        init_position=raw_pose
+                    )
+            else:
+                # Create a standard occupancy grid
+                self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                    resolution=self.grid_resolution,
+                    width=grid_width * self.grid_resolution,
+                    height=grid_height * self.grid_resolution,
+                    init_position=raw_pose
+                )
             
             # Initialize scan matcher now that we have a grid
             self._initialize_scan_matcher()
@@ -176,7 +221,7 @@ class SLAMCoordinator:
             # Set initial pose as the first grid update reference
             self.initial_pose = current_pose.copy()
         
-        # Convert scan from polar to Cartesian coordinates
+        # Convert scan from polar to Cartesian coordinates with configured orientation
         x_points, y_points = scan_converter.convert_scans_to_cartesian(
             scan_ranges, 
             self.angle_min, 
@@ -287,13 +332,34 @@ class SLAMCoordinator:
                 **self.scan_config
             )
             
-            # Update the grid
-            self.occupancy_grid.update_grid(
-                corrected_pose.x, 
-                corrected_pose.y, 
-                corrected_x_points, 
-                corrected_y_points
-            )
+            # Check for enhanced grid features
+            if self.use_enhanced_grid and hasattr(self.occupancy_grid, 'update_grid_with_turn_handling'):
+                # Detect if the robot is turning and update the grid with turn handling
+                if hasattr(self.occupancy_grid, 'detect_robot_turning'):
+                    self.is_turning, self.turn_rate = self.occupancy_grid.detect_robot_turning(corrected_pose.theta)
+                    # Store turn rates for analysis
+                    self.turn_rates.append(self.turn_rate)
+                else:
+                    self.is_turning = False
+                    self.turn_rate = 0.0
+                
+                # Use the turn-aware update method
+                self.occupancy_grid.update_grid_with_turn_handling(
+                    corrected_pose.x, 
+                    corrected_pose.y,
+                    corrected_pose.theta,
+                    corrected_x_points, 
+                    corrected_y_points,
+                    scan_ranges  # Pass original scan ranges for additional filtering
+                )
+            else:
+                # Use the standard update method for backward compatibility
+                self.occupancy_grid.update_grid(
+                    corrected_pose.x, 
+                    corrected_pose.y, 
+                    corrected_x_points, 
+                    corrected_y_points
+                )
         
         # Store the current scan for next iteration
         self.previous_scan = parsed_data.copy()
@@ -312,6 +378,13 @@ class SLAMCoordinator:
                 'pose_change_x': matched_pose['x'] - initial_pose['x'],
                 'pose_change_y': matched_pose['y'] - initial_pose['y'],
                 'pose_change_theta': matched_pose['theta'] - initial_pose['theta']
+            }
+        
+        # Add turn detection information if enabled
+        if self.use_enhanced_grid:
+            updated_data['turn_info'] = {
+                'is_turning': self.is_turning,
+                'turn_rate': self.turn_rate
             }
         
         return updated_data
@@ -373,11 +446,43 @@ class SLAMCoordinator:
                 avg_correction = sum(correction_distances) / len(correction_distances)
                 print(f"Average pose correction: {avg_correction:.4f} meters")
         
+        # Print enhanced grid statistics if available
+        if self.use_enhanced_grid and self.occupancy_grid and hasattr(self.occupancy_grid, 'stats'):
+            stats = self.occupancy_grid.stats
+            print(f"\nEnhanced Grid Statistics:")
+            print(f"  Free Cells: {stats['free_cell_count']}")
+            print(f"  Occupied Cells: {stats['occupied_cell_count']}")
+            print(f"  Unknown Cells: {stats['unknown_cell_count']}")
+            print(f"  Grid Expansions: {stats['resizes']}")
+        
         return updated_data_list
     
     def get_occupancy_grid(self):
         """Get the current occupancy grid"""
         return self.occupancy_grid
+    
+    def get_enhanced_grid_for_display(self, enhance_obstacles=True, show_dynamic=False):
+        """
+        Get the occupancy grid with enhanced visualization features
+        
+        Args:
+            enhance_obstacles (bool): Whether to enhance obstacles for display
+            show_dynamic (bool): Whether to highlight dynamic objects
+        
+        Returns:
+            numpy.ndarray: Enhanced grid for display, or None if grid not available
+        """
+        if not self.occupancy_grid:
+            return None
+            
+        if self.use_enhanced_grid and hasattr(self.occupancy_grid, 'get_grid_for_display'):
+            return self.occupancy_grid.get_grid_for_display(
+                enhance=enhance_obstacles,
+                show_dynamic=show_dynamic
+            )
+        else:
+            # Fallback to standard grid for backward compatibility
+            return self.occupancy_grid.get_grid()
     
     def get_pose_history(self):
         """Get the history of poses from the estimator"""
@@ -389,19 +494,54 @@ class SLAMCoordinator:
             return self.pose_estimator.get_confidence_history()
         return [result['confidence'] for result in self.scan_match_results]
     
+    def get_turn_history(self):
+        """Get the history of turn rates"""
+        return self.turn_rates
+    
+    def is_robot_turning(self):
+        """Check if the robot is currently turning"""
+        return self.is_turning
+    
     def reset(self):
         """Reset the SLAM system to initial state"""
         self.pose_estimator.reset()
         
         # Reset occupancy grid
         if self.occupancy_grid:
+            # Store the grid parameters
             grid_width = self.occupancy_grid.width
             grid_height = self.occupancy_grid.height
-            self.occupancy_grid = occupancy_grid.OccupancyGrid(
-                resolution=self.grid_resolution,
-                width=grid_width,
-                height=grid_height
-            )
+            
+            # Create a new occupancy grid with the same parameters
+            if self.use_enhanced_grid:
+                try:
+                    self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                        resolution=self.grid_resolution,
+                        width=grid_width,
+                        height=grid_height,
+                        expansion_factor=self.enhanced_grid_params['expansion_factor'],
+                        sensor_noise_variance=self.enhanced_grid_params['sensor_noise_variance']
+                    )
+                except TypeError:
+                    # Fall back to basic initialization if enhanced params aren't supported
+                    self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                        resolution=self.grid_resolution,
+                        width=grid_width,
+                        height=grid_height
+                    )
+            else:
+                self.occupancy_grid = occupancy_grid.OccupancyGrid(
+                    resolution=self.grid_resolution,
+                    width=grid_width,
+                    height=grid_height
+                )
+            
+            # Configure enhanced grid parameters if using enhanced grid
+            if self.use_enhanced_grid and hasattr(self.occupancy_grid, 'turn_detection_threshold'):
+                # Update the enhanced grid parameters
+                for param, value in self.enhanced_grid_params.items():
+                    if hasattr(self.occupancy_grid, param):
+                        setattr(self.occupancy_grid, param, value)
             
             # Re-initialize scan matcher
             self.scan_matcher = None
@@ -415,3 +555,8 @@ class SLAMCoordinator:
         self.scan_counter = 0
         self.scan_match_results = []
         self.pose_corrections = []
+        
+        # Reset turn tracking
+        self.is_turning = False
+        self.turn_rate = 0.0
+        self.turn_rates = []

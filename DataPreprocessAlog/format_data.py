@@ -1,14 +1,14 @@
 import re
 import os
 
-def format_flaser_data(input_filename, output_filename, inf_replacement=29.90, decimal_places=2):
+def format_flaser_data(input_filename, output_filename, inf_replacement=11.90, decimal_places=2):
     """
     Format FLASER data from input file and write to output file.
     
     Args:
         input_filename: Path to the input file
         output_filename: Path to the output file
-        inf_replacement: Value to replace 'inf' readings with (default: 30.00)
+        inf_replacement: Value to replace 'inf' readings with (default: 11.90)
         decimal_places: Number of decimal places for formatting floating point values (default: 2)
     """
     with open(input_filename, 'r') as infile, open(output_filename, 'w') as outfile:
@@ -44,7 +44,7 @@ def format_flaser_data(input_filename, output_filename, inf_replacement=29.90, d
             format_str = f"{{:.{decimal_places}f}}"
             
             for reading in readings:
-                if reading == 'inf' or reading == 'nan':
+                if reading == 'inf' or reading == 'nan' or reading > str(inf_replacement):
                     formatted_readings.append(format_str.format(inf_replacement))
                 else:
                     # Convert to float and format to specified decimal places
@@ -57,7 +57,7 @@ def format_flaser_data(input_filename, output_filename, inf_replacement=29.90, d
             
             # Create the formatted output line
             # Format: FLASER num_readings [range_readings] x y theta odom_x odom_y odom_theta timestamp hostname 0.000246
-            output_line = f"LiDAR_E300 {len(readings)} {' '.join(formatted_readings)} {' '.join(after_data)}"
+            output_line = f"RPLiDAR_A1 {len(readings)} {' '.join(formatted_readings)} {' '.join(after_data)}"
             outfile.write(output_line + '\n')
             
     print(f"Processing complete. Formatted data written to {output_filename}")
@@ -65,11 +65,11 @@ def format_flaser_data(input_filename, output_filename, inf_replacement=29.90, d
 # Script configuration - MODIFY THESE VALUES
 if __name__ == "__main__":
     # File paths - change these to your desired input and output paths
-    input_file = "../DataSet/RawData/laser_data.clf"
-    output_file = "../DataSet/RawData/raw_data_zjnu20_21_3F_big_one.clf"
+    input_file = "../DataSet/RawData/laser_data_yahboom.clf"
+    output_file = "../DataSet/RawData/raw_data_zjnu21_3F_yahboom.clf"
     
     # Settings
-    inf_replacement = 81.83  # Value to replace 'inf' with
+    inf_replacement = 11.9  # Value to replace 'inf' with
     decimal_places = 2      # Number of decimal places for formatted numbers
     
     print(f"Processing {input_file}...")

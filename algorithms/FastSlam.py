@@ -384,7 +384,7 @@ def main():
     coarse_factor = 5  # factor for coarse-to-fine scan matching
     
     # Load sensor data from file
-    sensor_data = readJson("../DataSet/DataPreprocessed/zjnu20_21_20-gfs")
+    sensor_data = readJson("../DataSet/DataPreprocessed/intel-gfs")
     
     # Get number of samples per revolution from first reading
     samples_per_rev = len(sensor_data[list(sensor_data)[0]]['range'])

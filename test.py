@@ -997,7 +997,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
 # Main execution
 if __name__ == "__main__":
     # File path to read LiDAR data from
-    file_path = "./DataSet/RawData/raw_data_zjnu20_21_3F.clf"
+    file_path = "./lidar_slam/dataset/raw_data/raw_data_synchronized_processed_reduced180.clf"
     
     # Run the visualization with occupancy grid mapping
     visualize_lidar_data_realtime(
