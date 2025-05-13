@@ -18,14 +18,9 @@ from matplotlib.patches import Circle
 # Add the parent directory to the path to import the modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-<<<<<<< HEAD
-from lidar_processing import data_parser, scan_converter
-from mapping import occupancy_grid
+from lidar_processing import scan_converter, data_parser
 from utils import file_utils
-=======
-from lidar_slam.lidar_processing import scan_converter, data_parser
-from lidar_slam.utils import file_utils
-from lidar_slam.mapping import occupancy_grid
+from mapping import occupancy_grid
 
 class PoseEstimate:
     """Class to represent a robot pose estimate with uncertainty"""
@@ -71,8 +66,6 @@ class PoseEstimate:
         """Normalize angle to [-π, π]"""
         self.theta = ((self.theta + math.pi) % (2 * math.pi)) - math.pi
         return self
-
->>>>>>> b3d78684c85791ae0882bed2bc4a641b1b3762e0
 
 class ScanMatcher:
     """
@@ -1867,7 +1860,7 @@ def main():
     parser.add_argument('--file', '-f', type=str, 
                        default="../dataset/raw_data/raw_data_zjnu20_21_3F.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max-entries', '-m', type=int, default=1000,
+    parser.add_argument('--max-entries', '-m', type=int, default=500,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--resolution', '-r', type=float, default=0.05,
                        help='Grid resolution in meters')

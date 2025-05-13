@@ -31,7 +31,7 @@ def parse_arguments():
                         default="./dataset/raw_data/laser_data_synchronized_data_u_turn_processed_reduced180.clf",
                         help='Path to the LiDAR data file')
     
-    parser.add_argument('--max-entries', '-m', type=int, default=50,
+    parser.add_argument('--max-entries', '-m', type=int, default=500,
                         help='Maximum number of entries to read from the file')
     
     parser.add_argument('--grid', '-g', action='store_true', default=True,
