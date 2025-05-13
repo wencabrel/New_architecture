@@ -107,9 +107,19 @@ class LiDARVisualizer:
         
         # Initialize plot elements for occupancy grid
         if occupancy_grid:
-            # Custom colormap for occupancy grid
-            self.grid_cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
-            self.grid_bounds = [0, 0.4, 0.6, 1]
+            # Check if enhanced grid features are available
+            has_enhanced_grid = hasattr(occupancy_grid, 'get_grid_for_display')
+            
+            # Custom colormap for occupancy grid with enhanced visualization capabilities
+            if has_enhanced_grid:
+                # Enhanced colormap: white (unknown), light gray (free), black (occupied), blue (enhanced), red (dynamic)
+                self.grid_cmap = colors.ListedColormap(['white', 'lightgray', 'black', 'darkblue', 'red'])
+                self.grid_bounds = [0, 0.4, 0.6, 0.8, 0.9, 1]
+            else:
+                # Basic colormap: white (unknown), light gray (free), black (occupied)
+                self.grid_cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+                self.grid_bounds = [0, 0.4, 0.6, 1]
+                
             self.grid_norm = colors.BoundaryNorm(self.grid_bounds, self.grid_cmap.N)
             
             # Grid image
@@ -126,11 +136,16 @@ class LiDARVisualizer:
             # Original grid limits for reset
             self.grid_original_xlim = None
             self.grid_original_ylim = None
+            
+            # Add new elements for turn detection visualization
+            self.turn_status_text = None
+            self.show_dynamic = False
         
         # Buttons
         self.pause_button = None
         self.follow_button = None
         self.save_button = None
+        self.dynamic_button = None  # New button for showing dynamic objects
     
     def _initialize_plot(self):
         """Initialize all plot elements for both LiDAR scan and occupancy grid"""
@@ -186,9 +201,22 @@ class LiDARVisualizer:
             width = self.occupancy_grid.width
             height = self.occupancy_grid.height
             
+            # Determine if we're using enhanced grid features
+            has_enhanced_grid = hasattr(self.occupancy_grid, 'get_grid_for_display')
+            
             # Initialize grid image
+            if has_enhanced_grid:
+                # Use enhanced display if available
+                grid_data = self.occupancy_grid.get_grid_for_display(
+                    enhance=True,
+                    show_dynamic=self.show_dynamic
+                )
+            else:
+                # Use standard grid data
+                grid_data = self.occupancy_grid.get_grid()
+                
             self.grid_img = self.ax2.imshow(
-                self.occupancy_grid.get_grid(),
+                grid_data,
                 cmap=self.grid_cmap,
                 norm=self.grid_norm,
                 origin='lower',
@@ -227,9 +255,41 @@ class LiDARVisualizer:
                 bbox=dict(facecolor='white', alpha=0.7)
             )
             
+            # Add turn detection status text if enhanced grid is available
+            if has_enhanced_grid:
+                self.turn_status_text = self.ax2.text(
+                    0.02, 0.82, "Motion: STRAIGHT", 
+                    transform=self.ax2.transAxes, 
+                    va='top', ha='left',
+                    color='green', fontweight='bold'
+                )
+            
+            # Create custom legend for grid
+            legend_elements = []
+            legend_labels = []
+            
+            # Basic elements for all grid types
+            legend_elements.append(plt.Rectangle((0, 0), 1, 1, fc='white', alpha=0.7))
+            legend_elements.append(plt.Rectangle((0, 0), 1, 1, fc='lightgray', alpha=0.7))
+            legend_elements.append(plt.Rectangle((0, 0), 1, 1, fc='black', alpha=0.7))
+            legend_labels.extend(['Unknown', 'Free', 'Occupied'])
+            
+            # Add enhanced elements if enhanced grid is available
+            if has_enhanced_grid:
+                legend_elements.append(plt.Rectangle((0, 0), 1, 1, fc='darkblue', alpha=0.7))
+                legend_elements.append(plt.Rectangle((0, 0), 1, 1, fc='red', alpha=0.7))
+                legend_labels.extend(['Enhanced', 'Dynamic'])
+            
+            # Add the legend
+            self.grid_legend = self.ax2.legend(
+                legend_elements,
+                legend_labels,
+                loc='lower right',
+                title='Map Legend'
+            )
+            
             # Set limits and legend
             self.ax2.set_aspect('equal')
-            self.ax2.legend(loc='upper right')
             
             # Store original limits for reset
             self.grid_original_xlim = self.ax2.get_xlim()
@@ -267,10 +327,15 @@ class LiDARVisualizer:
             self.view_map_button.on_clicked(self.view_full_map)
             
             # Save Map button
+<<<<<<< HEAD
             save_button_ax = plt.axes([0.75, 0.05, 0.1, 0.04])
+=======
+            save_button_ax = plt.axes([0.6, 0.05, 0.1, 0.04])
+>>>>>>> b3d78684c85791ae0882bed2bc4a641b1b3762e0
             self.save_button = Button(save_button_ax, 'Save Map', 
                                     color='lightblue', hovercolor='0.8')
             self.save_button.on_clicked(self.save_current_map)
+<<<<<<< HEAD
 
     # Add this method to the LiDARVisualizer class
     def view_full_map(self, event):
@@ -293,6 +358,15 @@ class LiDARVisualizer:
         
         # Redraw the figure
         self.fig.canvas.draw_idle()
+=======
+            
+            # Add a new button for showing dynamic objects (if enhanced grid is available)
+            if hasattr(self.occupancy_grid, 'get_grid_for_display'):
+                dynamic_button_ax = plt.axes([0.75, 0.05, 0.1, 0.04])
+                self.dynamic_button = Button(dynamic_button_ax, 'Show Dynamic', 
+                                           color='lightsalmon', hovercolor='salmon')
+                self.dynamic_button.on_clicked(self.toggle_dynamic)
+>>>>>>> b3d78684c85791ae0882bed2bc4a641b1b3762e0
     
     def toggle_pause(self, event):
         """Toggle animation pause/play"""
@@ -315,6 +389,23 @@ class LiDARVisualizer:
             if self.follow_robot and self.displayed_path_x:
                 self._center_on_robot()
                 self.fig.canvas.draw_idle()
+    
+    def toggle_dynamic(self, event):
+        """Toggle visualization of dynamic objects"""
+        if not hasattr(self.occupancy_grid, 'get_grid_for_display'):
+            return
+        
+        self.show_dynamic = not self.show_dynamic
+        self.dynamic_button.label.set_text('Hide Dynamic' if self.show_dynamic else 'Show Dynamic')
+        
+        # Update the display immediately
+        if self.grid_img is not None:
+            grid_data = self.occupancy_grid.get_grid_for_display(
+                enhance=True, 
+                show_dynamic=self.show_dynamic
+            )
+            self.grid_img.set_data(grid_data)
+            self.fig.canvas.draw_idle()
     
     def _center_on_robot(self):
         """Center the occupancy grid view on the current robot position"""
@@ -396,11 +487,38 @@ class LiDARVisualizer:
         start_pos = path_coords[0] if path_coords else None
         current_pos = path_coords[-1] if path_coords else None
         
-        # Save as image
-        grid = self.occupancy_grid.get_grid()
+        # Check if the enhanced save method is available
+        if hasattr(self.occupancy_grid, 'save_to_file') and callable(getattr(self.occupancy_grid, 'save_to_file')):
+            try:
+                # Use enhanced save with additional options
+                self.occupancy_grid.save_to_file(
+                    base_filename, 
+                    format='all',
+                    include_metadata=True,
+                    robot_path=path_coords,
+                    start_position=start_pos,
+                    current_position=current_pos,
+                    enhance_for_display=True,
+                    show_dynamic=self.show_dynamic if hasattr(self, 'show_dynamic') else False
+                )
+                print(f"\nOccupancy grid map saved to {base_filename} with current robot path and positions")
+            except Exception as e:
+                print(f"Error using enhanced save: {e}")
+                # Fall back to basic save method
+                self._basic_save_grid(base_filename, path_coords, start_pos, current_pos)
+        else:
+            # Use basic save method
+            self._basic_save_grid(base_filename, path_coords, start_pos, current_pos)
+
+    def _basic_save_grid(self, base_filename, path_coords, start_pos, current_pos):
+        """Basic fallback method to save grid as image"""
+        # Save grid with metadata
+        self.occupancy_grid.save_to_file(base_filename, format='all', include_metadata=True)
+        
+        # Also save as image using file_utils
         file_utils.save_grid_as_image(
-            grid, 
-            base_filename, 
+            self.occupancy_grid.get_grid(),
+            base_filename,
             resolution=self.occupancy_grid.resolution,
             width=self.occupancy_grid.width,
             height=self.occupancy_grid.height,
@@ -409,10 +527,7 @@ class LiDARVisualizer:
             current_position=current_pos
         )
         
-        # Also save raw grid data and metadata
-        self.occupancy_grid.save_to_file(base_filename, format='all', include_metadata=True)
-        
-        print(f"\nOccupancy grid map saved to {base_filename} with current robot path and positions")
+        print(f"\nOccupancy grid map saved to {base_filename}")
     
     def _update_frame(self, frame):
         """
@@ -447,6 +562,12 @@ class LiDARVisualizer:
             robot_x = -robot_x
         if self.config['flip_y']:
             robot_y = -robot_y
+        
+        # Store current robot position for zoom centering
+        if self.occupancy_grid and self.ax2:
+            # If following robot is enabled, center the view on the robot
+            if self.follow_robot:
+                self._center_on_robot()
         
         # Update robot position
         self.robot_pos.set_offsets([[robot_x, robot_y]])
@@ -500,11 +621,38 @@ class LiDARVisualizer:
         
         # Update occupancy grid if enabled
         if self.occupancy_grid and self.ax2:
-            # Update the grid with current scan
-            self.occupancy_grid.update_grid(robot_x, robot_y, x_points, y_points)
+            # Check if the enhanced grid features are available
+            has_enhanced_grid = hasattr(self.occupancy_grid, 'get_grid_for_display')
             
-            # Update the grid image
-            self.grid_img.set_data(self.occupancy_grid.get_grid())
+            # Check for turn information in parsed data
+            is_turning = False
+            turn_rate = 0.0
+            
+            if 'turn_info' in parsed_data:
+                is_turning = parsed_data['turn_info']['is_turning']
+                turn_rate = parsed_data['turn_info']['turn_rate']
+                
+                # Update turn status text if it exists
+                if self.turn_status_text:
+                    turn_status = "TURNING" if is_turning else "STRAIGHT"
+                    turn_color = "red" if is_turning else "green"
+                    self.turn_status_text.set_text(f"Motion: {turn_status} (rate: {abs(turn_rate):.3f} rad/update)")
+                    self.turn_status_text.set_color(turn_color)
+            
+            # Update the grid image with appropriate grid data
+            if has_enhanced_grid:
+                # Use enhanced grid display with turn and dynamic object visualization
+                grid_data = self.occupancy_grid.get_grid_for_display(
+                    enhance=True,
+                    show_dynamic=self.show_dynamic
+                )
+                self.grid_img.set_data(grid_data)
+            else:
+                # Update the grid with current scan (fallback to original method)
+                self.occupancy_grid.update_grid(robot_x, robot_y, x_points, y_points)
+                
+                # Update the grid image with standard grid data
+                self.grid_img.set_data(self.occupancy_grid.get_grid())
             
             # Update the grid path
             self.grid_path_line.set_data(self.displayed_path_x, self.displayed_path_y)
@@ -516,13 +664,14 @@ class LiDARVisualizer:
             # Update current position
             self.grid_current_pos.set_offsets([[robot_x, robot_y]])
             
-            # Follow robot if enabled
-            if self.follow_robot:
-                self._center_on_robot()
-        
-        # Return updated elements
-        return (self.scatter, self.robot_pos, self.path_line, self.timestamp_text, 
-               self.robot_id_text, self.pose_text, self.settings_text, self.arrow)
+            # Return updated elements including grid-specific elements
+            return (self.scatter, self.robot_pos, self.path_line, self.timestamp_text, self.robot_id_text, 
+                   self.pose_text, self.settings_text, self.arrow, self.grid_img, self.grid_path_line, 
+                   self.grid_current_pos, self.grid_start_point)
+        else:
+            # Return updated elements for LiDAR scan only
+            return (self.scatter, self.robot_pos, self.path_line, self.timestamp_text, self.robot_id_text, 
+                   self.pose_text, self.settings_text, self.arrow)
     
     def animate(self, interval=50):
         """
@@ -562,8 +711,14 @@ class LiDARVisualizer:
         """
         self.animate(interval)
         
-        # Adjust layout and display the single window
-        plt.tight_layout()
+        # Adjust layout for different configurations
+        if self.occupancy_grid and self.ax2:
+            # For dual-plot layout with buttons, use a more flexible approach
+            plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.15, wspace=0.1)
+        else:
+            # For single plot, tight_layout works fine
+            plt.tight_layout()
+            
         plt.show()
         
         # Save the final grid if requested
@@ -577,19 +732,26 @@ class LiDARVisualizer:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(save_path, f"occupancy_grid_{timestamp}")
             
-            # Save grid with metadata
-            self.occupancy_grid.save_to_file(filename, format='all', include_metadata=True)
-            
-            # Also save as image
-            file_utils.save_grid_as_image(
-                self.occupancy_grid.get_grid(),
-                filename,
-                resolution=self.occupancy_grid.resolution,
-                width=self.occupancy_grid.width,
-                height=self.occupancy_grid.height,
-                robot_path=path_coords,
-                start_position=start_pos,
-                current_position=final_pos
-            )
+            # Check if enhanced save is available
+            if hasattr(self.occupancy_grid, 'save_to_file') and callable(getattr(self.occupancy_grid, 'save_to_file')):
+                try:
+                    # Use enhanced save with additional options
+                    self.occupancy_grid.save_to_file(
+                        filename, 
+                        format='all',
+                        include_metadata=True,
+                        robot_path=path_coords,
+                        start_position=start_pos,
+                        current_position=final_pos,
+                        enhance_for_display=True,
+                        show_dynamic=self.show_dynamic if hasattr(self, 'show_dynamic') else False
+                    )
+                except Exception as e:
+                    print(f"Error using enhanced save: {e}")
+                    # Fall back to basic save
+                    self._basic_save_grid(filename, path_coords, start_pos, final_pos)
+            else:
+                # Use basic save method
+                self._basic_save_grid(filename, path_coords, start_pos, final_pos)
             
             print(f"\nFinal occupancy grid map saved to {filename}")

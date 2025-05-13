@@ -1233,7 +1233,11 @@ def visualize_lidar_data_with_scan_matching(file_path, max_entries=200,
 # Main execution example
 if __name__ == "__main__":
     # File path to read LiDAR data from
+<<<<<<< HEAD
     file_path = "./lidar_slam/dataset/raw_data/laser_data_synchronized_data_drift_turn_reduced180.clf"
+=======
+    file_path = "./lidar_slam/dataset/raw_data/raw_data_synchronized_processed_reduced180.clf"
+>>>>>>> b3d78684c85791ae0882bed2bc4a641b1b3762e0
     
     # Run the enhanced visualization with scan matching
     visualize_lidar_data_with_scan_matching(
