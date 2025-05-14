@@ -49,7 +49,7 @@ class PoseEstimate:
 class ImprovedScanMatchingLocalization:
     """
     Improved implementation of scan matching localization using ICP algorithm
-    with aggressive resampling to never accept unmapped regions.
+    with adaptive parameters, alignment reset, and aggressive resampling to prevent unmapped regions.
     """
     
     def __init__(self, occupancy_grid=None, debug_level=1):
@@ -63,34 +63,36 @@ class ImprovedScanMatchingLocalization:
         self.map = occupancy_grid
         self.debug_level = debug_level
         
-        # Default ICP parameters 
+        # Default ICP parameters (will be adjusted adaptively)
         self.max_iterations = 15
         self.convergence_threshold = 0.001
         self.max_correspondence_distance = 1.5  # meters
         
         # Parameters for adaptive adjustment
         self.default_correspondence_distance = 1.5  # Starting value
-        self.max_possible_correspondence_distance = 5.0  # Maximum allowed value - INCREASED for resampling
+        self.max_possible_correspondence_distance = 3.0  # Maximum allowed value
         self.min_correspondence_distance = 1.0  # Minimum allowed value
         
-        # Occupancy threshold 
+        # For aggressive resampling (when no correspondences found)
+        self.aggressive_max_correspondence_distance = 5.0  # Much larger search radius
+        self.aggressive_max_resampling_attempts = 5  # How many times to try resampling
+        
+        # Occupancy threshold (will be adjusted adaptively)
         self.occupancy_threshold = 0.55
         self.default_occupancy_threshold = 0.55  # Starting value
-        self.min_occupancy_threshold = 0.03  # Minimum allowed value - LOWERED for resampling
+        self.min_occupancy_threshold = 0.45  # Minimum allowed value
         
-        # Motion validation parameters 
-        self.max_translation_per_frame = 0.05  # meters
-        self.default_max_translation = 0.05  # Starting value
+        # For aggressive resampling
+        self.aggressive_min_occupancy_threshold = 0.35  # Much lower threshold
+        
+        # Motion validation parameters (will be adjusted adaptively)
+        self.max_translation_per_frame = 0.5  # meters
+        self.default_max_translation = 0.5  # Starting value
         self.max_possible_translation = 1.0  # Maximum allowed value
         
-        self.max_rotation_per_frame = 0.05  # radians (~28 degrees)
-        self.default_max_rotation = 0.05  # Starting value
-        self.max_possible_rotation = 0.08  # Maximum allowed value
-        
-        # Resampling parameters
-        self.max_resampling_attempts = 5  # Maximum number of resampling attempts
-        self.resampling_radius_multiplier = 1.5  # How much to increase search radius each attempt
-        self.resampling_threshold_reduction = 0.1  # How much to lower threshold each attempt
+        self.max_rotation_per_frame = 0.5  # radians (~28 degrees)
+        self.default_max_rotation = 0.5  # Starting value
+        self.max_possible_rotation = 0.8  # Maximum allowed value
         
         # Current estimated trajectory
         self.trajectory = []  # List of PoseEstimate objects
@@ -138,16 +140,17 @@ class ImprovedScanMatchingLocalization:
         self.should_expand_map = False
         self.force_map_expansion = False  # Used for emergency expansion
         
-        # Performance tracking for resampling
-        self.resampling_count = 0
-        self.resampling_success_rate = 0
+        # Resampling stats
+        self.resampling_attempts = 0  # Track how many times we've had to resample
+        self.frames_with_resampling = 0  # Track how many frames needed resampling
         
         if self.debug_level > 0:
-            print("[ScanMatcher] Initialized with aggressive resampling strategy")
+            print("[ScanMatcher] Initialized with adaptive parameters and aggressive resampling")
             print(f"[ScanMatcher]   - Base correspondence distance: {self.default_correspondence_distance}m (can increase to {self.max_possible_correspondence_distance}m)")
             print(f"[ScanMatcher]   - Base occupancy threshold: {self.occupancy_threshold} (can decrease to {self.min_occupancy_threshold})")
-            print(f"[ScanMatcher]   - Max resampling attempts: {self.max_resampling_attempts}")
+            print(f"[ScanMatcher]   - Base max translation: {self.max_translation_per_frame}m (can increase to {self.max_possible_translation}m)")
             print(f"[ScanMatcher]   - Alignment reset interval: {self.reset_interval} frames (drift threshold: {self.drift_threshold}m)")
+            print(f"[ScanMatcher]   - Aggressive resampling enabled (max search radius: {self.aggressive_max_correspondence_distance}m, min threshold: {self.aggressive_min_occupancy_threshold})")
             print("\n" + "="*80)
             print("        POSE INFORMATION FOR EACH SCAN MATCH WILL BE PRINTED BELOW")
             print("="*80 + "\n")
@@ -171,7 +174,7 @@ class ImprovedScanMatchingLocalization:
             List of updated pose estimates (trajectory)
         """
         if self.debug_level > 0:
-            print("[ScanMatcher] Processing sensor data with ICP scan matching (aggressive resampling)...")
+            print("[ScanMatcher] Processing sensor data with ICP scan matching...")
         
         # Initialize trajectory with initial pose if provided
         if initial_pose:
@@ -325,7 +328,7 @@ class ImprovedScanMatchingLocalization:
                     recovery_pose = self.createRecoveryPose(odometry_pose, self.last_matched_pose)
                     match_info = {
                         'iterations': 0,
-                        'final_score': 0.5,
+                        'final_score': 0.5,  # Arbitrary middle score
                         'error': 0.0,
                         'correspondences': 0,
                         'resampling_attempts': 0
@@ -353,10 +356,20 @@ class ImprovedScanMatchingLocalization:
                         self.consecutive_poor_matches = 0
                         print(f"\n[ScanMatcher] Exiting recovery mode")
                 else:
-                    # Normal mode - match current scan against the map using ICP with resampling
-                    matched_pose, match_info = self.matchScanWithResampling(scan_x, scan_y, initial_guess)
+                    # Normal mode - match current scan against the map using ICP
+                    matched_pose, match_info = self.matchScan(scan_x, scan_y, initial_guess)
                     
-                    # Check if we should expand the map based on boundary points
+                    # Check if we have the special case of resampling
+                    if match_info['resampling_attempts'] > 0:
+                        resampling_str = f"[ScanMatcher] Used aggressive resampling - {match_info['resampling_attempts']} attempts needed"
+                        if match_info['correspondences'] > 0:
+                            resampling_str += f", found {match_info['correspondences']} correspondences"
+                        print(f"\n{resampling_str}")
+                        
+                        self.frames_with_resampling += 1
+                        self.resampling_attempts += match_info['resampling_attempts']
+                        
+                    # Check for boundary issues - if many points are out of bounds, flag for map expansion
                     if self.checkForMapBoundaryIssues(scan_x, scan_y, matched_pose):
                         self.should_expand_map = True
                         
@@ -432,189 +445,12 @@ class ImprovedScanMatchingLocalization:
         
         if self.debug_level > 0:
             print(f"\n[ScanMatcher] Processed {len(lidar_data)} scans. Trajectory contains {len(self.trajectory)} poses.")
-            if self.resampling_count > 0:
-                print(f"[ScanMatcher] Resampling stats: {self.resampling_count} attempts, "
-                      f"{self.resampling_success_rate/self.resampling_count*100:.1f}% success rate")
+            if self.frames_with_resampling > 0:
+                print(f"[ScanMatcher] Aggressive resampling was used in {self.frames_with_resampling} frames " 
+                      f"({self.frames_with_resampling/self.match_count*100:.1f}% of matches).")
+                print(f"[ScanMatcher] Average of {self.resampling_attempts/self.frames_with_resampling:.1f} " 
+                      f"resampling attempts per frame when needed.")
         return self.trajectory
-    
-    def matchScanWithResampling(self, scan_x, scan_y, initial_pose):
-        """
-        Match the current scan against the map using ICP algorithm with aggressive resampling
-        
-        Args:
-            scan_x: List of scan x coordinates
-            scan_y: List of scan y coordinates
-            initial_pose: Initial pose estimate (PoseEstimate object)
-            
-        Returns:
-            Updated pose estimate (PoseEstimate object) and match info dictionary
-        """
-        # Create points array from scan
-        scan_points = np.column_stack((scan_x, scan_y))
-        
-        # Save original parameters for restoring later
-        original_correspondence_distance = self.max_correspondence_distance
-        original_occupancy_threshold = self.occupancy_threshold
-        
-        # Initialize resampling variables
-        resampling_attempts = 0
-        current_correspondence_distance = self.max_correspondence_distance
-        current_occupancy_threshold = self.occupancy_threshold
-        
-        # Resampling loop - keep trying with more aggressive parameters until we find correspondences
-        while resampling_attempts <= self.max_resampling_attempts:
-            if resampling_attempts > 0:
-                # Increase search radius and decrease threshold for each resampling attempt
-                current_correspondence_distance = min(
-                    self.max_possible_correspondence_distance,
-                    current_correspondence_distance * self.resampling_radius_multiplier
-                )
-                current_occupancy_threshold = max(
-                    self.min_occupancy_threshold,
-                    current_occupancy_threshold - self.resampling_threshold_reduction
-                )
-                
-                # Set the new parameters
-                self.max_correspondence_distance = current_correspondence_distance
-                self.occupancy_threshold = current_occupancy_threshold
-                
-                if self.debug_level > 0:
-                    print(f"\n[ScanMatcher] Resampling attempt {resampling_attempts}/{self.max_resampling_attempts} with: "
-                          f"distance = {current_correspondence_distance:.2f}m, threshold = {current_occupancy_threshold:.2f}")
-            
-            # Try matching with current parameters
-            matched_pose, match_info = self.matchScan(scan_x, scan_y, initial_pose)
-            
-            # Check if we found correspondences
-            if match_info['correspondences'] >= 5:  # Minimum acceptable number of correspondences
-                # Resampling succeeded
-                self.resampling_count += resampling_attempts
-                self.resampling_success_rate += 1
-                
-                # Add resampling info to match_info
-                match_info['resampling_attempts'] = resampling_attempts
-                
-                if resampling_attempts > 0 and self.debug_level > 0:
-                    print(f"[ScanMatcher] ✓ Resampling succeeded after {resampling_attempts} attempt(s). "
-                          f"Found {match_info['correspondences']} correspondences.")
-                
-                # Restore original parameters
-                self.max_correspondence_distance = original_correspondence_distance
-                self.occupancy_threshold = original_occupancy_threshold
-                
-                return matched_pose, match_info
-            
-            # Increment resampling attempts
-            resampling_attempts += 1
-        
-        # If we get here, all resampling attempts failed
-        self.resampling_count += resampling_attempts
-        
-        if self.debug_level > 0:
-            print(f"\n[ScanMatcher] ✗ Resampling failed after {resampling_attempts} attempts. "
-                  f"Using most aggressive attempt result anyway.")
-        
-        # Use the final match info from the most aggressive attempt
-        match_info['resampling_attempts'] = resampling_attempts
-        
-        # Restore original parameters
-        self.max_correspondence_distance = original_correspondence_distance
-        self.occupancy_threshold = original_occupancy_threshold
-        
-        return matched_pose, match_info
-    
-    def matchScan(self, scan_x, scan_y, initial_pose):
-        """
-        Match the current scan against the map using ICP algorithm
-        
-        Args:
-            scan_x: List of scan x coordinates
-            scan_y: List of scan y coordinates
-            initial_pose: Initial pose estimate (PoseEstimate object)
-            
-        Returns:
-            Updated pose estimate (PoseEstimate object) and match info dictionary
-        """
-        # Create points array from scan
-        scan_points = np.column_stack((scan_x, scan_y))
-        
-        # Initialize transformation from initial pose
-        current_pose = initial_pose.copy()
-        prev_error = float('inf')
-        
-        # For visualization
-        iterations_data = []
-        
-        # Main ICP loop
-        for iteration in range(self.max_iterations):
-            # Transform scan points to world frame using current pose
-            transformed_points = self.transformPointsToWorld(scan_points, current_pose)
-            
-            # Find correspondences between scan points and map
-            correspondences, mean_error = self.findCorrespondences(transformed_points)
-            
-            # Debug print for correspondences
-            if self.debug_level > 2 and iteration == 0:
-                n_points = len(transformed_points)
-                n_correspondences = len(correspondences)
-                print(f"\n[ScanMatcher] Iteration {iteration}: Found {n_correspondences}/{n_points} "
-                      f"correspondences ({n_correspondences/max(1,n_points)*100:.1f}%)")
-            
-            if len(correspondences) < 3:  # Not enough correspondences
-                if self.debug_level > 1:
-                    print(f"\n[ScanMatcher] Warning: Only {len(correspondences)} correspondences found in iteration {iteration+1}.")
-                break
-            
-            # Store the current pose before updating
-            prev_pose = current_pose.copy()
-            
-            # Estimate new transformation that minimizes the distance between corresponding points
-            updated_pose = self.estimateTransformation(scan_points, correspondences, current_pose)
-            
-            # Calculate the change in pose
-            pose_change = self.calculatePoseChange(current_pose, updated_pose)
-            
-            # Store iteration data for visualization
-            iterations_data.append({
-                'iteration': iteration,
-                'pose': updated_pose.copy(),
-                'error': mean_error,
-                'correspondences': len(correspondences),
-                'transformed_points': transformed_points.copy()
-            })
-            
-            # Update current pose
-            current_pose = updated_pose
-            
-            # Check for convergence
-            if abs(prev_error - mean_error) < self.convergence_threshold:
-                if self.debug_level > 2:
-                    print(f"\n[ScanMatcher] ICP converged after {iteration+1} iterations. Error: {mean_error:.6f}")
-                break
-                
-            prev_error = mean_error
-        
-        # Score the final match - FIXED to handle cases with no valid points
-        final_score = self.scoreFinalMatch(scan_points, current_pose)
-        
-        # Store visualization data
-        self.current_visualization_data = {
-            'iterations': iterations_data,
-            'final_pose': current_pose,
-            'initial_pose': initial_pose,
-            'scan_points': scan_points,
-            'final_score': final_score
-        }
-        
-        # Return the matched pose and match information
-        match_info = {
-            'iterations': len(iterations_data),
-            'final_score': final_score,
-            'error': prev_error,
-            'correspondences': len(correspondences) if correspondences is not None else 0
-        }
-        
-        return current_pose, match_info
     
     def adaptParametersBasedOnMatchQuality(self, match_info=None):
         """
@@ -628,8 +464,7 @@ class ImprovedScanMatchingLocalization:
             self.match_qualities.append({
                 'score': match_info['final_score'],
                 'correspondences': match_info['correspondences'],
-                'error': match_info['error'],
-                'resampling_attempts': match_info.get('resampling_attempts', 0)
+                'error': match_info['error']
             })
             
             # Keep only the most recent N matches
@@ -643,10 +478,9 @@ class ImprovedScanMatchingLocalization:
         # Calculate the average match quality
         avg_score = sum(q['score'] for q in self.match_qualities) / len(self.match_qualities)
         avg_correspondences = sum(q['correspondences'] for q in self.match_qualities) / len(self.match_qualities)
-        avg_resampling = sum(q.get('resampling_attempts', 0) for q in self.match_qualities) / len(self.match_qualities)
         
         # Check if we're having matching problems
-        poor_match = avg_score < self.match_quality_threshold or avg_correspondences < 10 or avg_resampling > 1
+        poor_match = avg_score < self.match_quality_threshold or avg_correspondences < 10
         
         # Get the most recent match result
         last_match = self.match_qualities[-1]
@@ -656,7 +490,7 @@ class ImprovedScanMatchingLocalization:
             self.consecutive_poor_matches += 1
             
             # Adaptively increase search parameters based on consecutive poor matches
-            adjustment_factor = min(1.0, 0.2 * self.consecutive_poor_matches + 0.1 * avg_resampling)
+            adjustment_factor = min(1.0, 0.2 * self.consecutive_poor_matches)  # Up to 100% adjustment
             
             # Increase search radius
             self.max_correspondence_distance = min(
@@ -895,12 +729,11 @@ class ImprovedScanMatchingLocalization:
             
             # Print match info if available
             if match_info:
-                # Include resampling attempts info if available
-                resampling_attempts = match_info.get('resampling_attempts', 0)
-                if resampling_attempts > 0:
+                # Include resampling info
+                if match_info.get('resampling_attempts', 0) > 0:
                     print(f"MATCH INFO:       Score={match_info['final_score']:.4f}, Iterations={match_info['iterations']}, "
                           f"Error={match_info['error']:.6f}, Correspondences={match_info['correspondences']}, "
-                          f"Resampling attempts={resampling_attempts}")
+                          f"Resampling Attempts={match_info['resampling_attempts']}")
                 else:
                     print(f"MATCH INFO:       Score={match_info['final_score']:.4f}, Iterations={match_info['iterations']}, "
                           f"Error={match_info['error']:.6f}, Correspondences={match_info['correspondences']}")
@@ -919,6 +752,153 @@ class ImprovedScanMatchingLocalization:
     def normalize_angle(self, angle):
         """Normalize angle to [-π, π]"""
         return ((angle + math.pi) % (2 * math.pi)) - math.pi
+    
+    def matchScan(self, scan_x, scan_y, initial_pose):
+        """
+        Match the current scan against the map using ICP algorithm with aggressive resampling
+        
+        Args:
+            scan_x: List of scan x coordinates
+            scan_y: List of scan y coordinates
+            initial_pose: Initial pose estimate (PoseEstimate object)
+            
+        Returns:
+            Updated pose estimate (PoseEstimate object) and match info dictionary
+        """
+        # Create points array from scan
+        scan_points = np.column_stack((scan_x, scan_y))
+        
+        # Transform scan points to world frame using initial pose
+        transformed_points = self.transformPointsToWorld(scan_points, initial_pose)
+        
+        # Try with normal parameters first
+        current_pose = initial_pose.copy()
+        correspondences, mean_error = self.findCorrespondences(transformed_points)
+        
+        # If we don't have enough correspondences, use aggressive resampling
+        resampling_attempts = 0
+        original_max_correspondence_distance = self.max_correspondence_distance
+        original_occupancy_threshold = self.occupancy_threshold
+        
+        if len(correspondences) < 5:
+            if self.debug_level > 1:
+                print(f"\n[ScanMatcher] Only {len(correspondences)} correspondences found initially. Starting aggressive resampling.")
+            
+            # Gradually increase search parameters until we find enough correspondences
+            for attempt in range(1, self.aggressive_max_resampling_attempts + 1):
+                resampling_attempts += 1
+                
+                # Calculate more aggressive parameters based on attempt number
+                progress = attempt / self.aggressive_max_resampling_attempts
+                
+                # Increase search radius dramatically
+                search_radius = self.max_correspondence_distance + progress * (self.aggressive_max_correspondence_distance - self.max_correspondence_distance)
+                
+                # Lower occupancy threshold dramatically
+                occupancy_threshold = self.occupancy_threshold - progress * (self.occupancy_threshold - self.aggressive_min_occupancy_threshold)
+                
+                if self.debug_level > 1:
+                    print(f"[ScanMatcher] Resampling attempt {attempt}: search radius={search_radius:.2f}m, "
+                          f"occupancy threshold={occupancy_threshold:.2f}")
+                
+                # Temporarily set the new parameters
+                self.max_correspondence_distance = search_radius
+                self.occupancy_threshold = occupancy_threshold
+                
+                # Try to find correspondences with these more aggressive parameters
+                correspondences, mean_error = self.findCorrespondences(transformed_points)
+                
+                if len(correspondences) >= 5:
+                    if self.debug_level > 1:
+                        print(f"[ScanMatcher] Found {len(correspondences)} correspondences after {attempt} resampling attempts.")
+                    break
+            
+            # Restore original parameters
+            self.max_correspondence_distance = original_max_correspondence_distance
+            self.occupancy_threshold = original_occupancy_threshold
+        
+        # If we still don't have enough correspondences, use the initial pose
+        if len(correspondences) < 5:
+            if self.debug_level > 0:
+                print(f"\n[ScanMatcher] Warning: Still only found {len(correspondences)} correspondences "
+                      f"after {resampling_attempts} resampling attempts.")
+            
+            # Use initial pose but flag it as a poor match
+            return initial_pose.copy(), {
+                'iterations': 0,
+                'final_score': 0.3,  # Low score to indicate it's not a good match
+                'error': float('inf'),
+                'correspondences': len(correspondences),
+                'resampling_attempts': resampling_attempts
+            }
+        
+        # Now proceed with ICP using the found correspondences
+        iterations_data = []
+        prev_error = mean_error
+        
+        # Main ICP loop
+        for iteration in range(self.max_iterations):
+            # Store the current pose before updating
+            prev_pose = current_pose.copy()
+            
+            # Estimate new transformation that minimizes the distance between corresponding points
+            updated_pose = self.estimateTransformation(scan_points, correspondences, current_pose)
+            
+            # Store iteration data for visualization
+            iterations_data.append({
+                'iteration': iteration,
+                'pose': updated_pose.copy(),
+                'error': mean_error,
+                'correspondences': len(correspondences),
+                'transformed_points': transformed_points.copy()
+            })
+            
+            # Update current pose
+            current_pose = updated_pose
+            
+            # Transform scan points to world frame using the updated pose
+            transformed_points = self.transformPointsToWorld(scan_points, current_pose)
+            
+            # Find new correspondences
+            correspondences, mean_error = self.findCorrespondences(transformed_points)
+            
+            # If we lost too many correspondences, stop
+            if len(correspondences) < 5:
+                if self.debug_level > 1:
+                    print(f"\n[ScanMatcher] Lost correspondences during ICP (down to {len(correspondences)}). Stopping.")
+                break
+            
+            # Check for convergence
+            if abs(prev_error - mean_error) < self.convergence_threshold:
+                if self.debug_level > 2:
+                    print(f"\n[ScanMatcher] ICP converged after {iteration+1} iterations. Error: {mean_error:.6f}")
+                break
+                
+            prev_error = mean_error
+        
+        # Score the final match
+        final_score = self.scoreFinalMatch(scan_points, current_pose)
+        
+        # Store visualization data
+        self.current_visualization_data = {
+            'iterations': iterations_data,
+            'final_pose': current_pose,
+            'initial_pose': initial_pose,
+            'scan_points': scan_points,
+            'final_score': final_score,
+            'resampling_attempts': resampling_attempts
+        }
+        
+        # Return the matched pose and match information
+        match_info = {
+            'iterations': len(iterations_data),
+            'final_score': final_score,
+            'error': prev_error,
+            'correspondences': len(correspondences),
+            'resampling_attempts': resampling_attempts
+        }
+        
+        return current_pose, match_info
     
     def transformPointsToWorld(self, points, pose):
         """
@@ -1020,7 +1000,7 @@ class ImprovedScanMatchingLocalization:
                 
                 # Check if within grid bounds
                 if (0 <= nx < self.map.grid_width and 0 <= ny < self.map.grid_height):
-                    # Check if this cell is occupied - USING LOWER THRESHOLD
+                    # Check if this cell is occupied - USING CURRENT THRESHOLD
                     if self.map.grid[ny, nx] > self.occupancy_threshold:
                         # Calculate Euclidean distance
                         distance = math.sqrt(dx**2 + dy**2)
@@ -1178,17 +1158,15 @@ class ImprovedScanMatchingLocalization:
         Returns:
             Boolean indicating if the match is valid
         """
-        # If resampling was needed, but still found few correspondences, consider invalid
-        if match_info.get('resampling_attempts', 0) >= self.max_resampling_attempts - 1 and match_info['correspondences'] < 10:
-            if self.debug_level > 1:
-                print(f"\n[ScanMatcher] Match rejected: Required {match_info.get('resampling_attempts')} resampling attempts "
-                      f"but only found {match_info['correspondences']} correspondences.")
-            return False
+        # If there were resampling attempts but still few correspondences, be stricter
+        min_required_correspondences = 5
+        if match_info['resampling_attempts'] > 0:
+            min_required_correspondences = 3 + match_info['resampling_attempts']
             
-        # If no correspondences were found after resampling, match is invalid
-        if match_info['correspondences'] < 3:  # Lowered from 5 to 3 due to resampling
+        # If no correspondences were found, match is invalid
+        if match_info['correspondences'] < min_required_correspondences:
             if self.debug_level > 1:
-                print(f"\n[ScanMatcher] Match rejected: Too few correspondences ({match_info['correspondences']} < 3)")
+                print(f"\n[ScanMatcher] Match rejected: Too few correspondences ({match_info['correspondences']} < {min_required_correspondences})")
             return False
         
         # Calculate pose change
@@ -1206,10 +1184,14 @@ class ImprovedScanMatchingLocalization:
                 print(f"\n[ScanMatcher] Match rejected: Rotation too large ({abs(pose_change['dtheta']):.3f}rad > {self.max_rotation_per_frame}rad)")
             return False
         
-        # Check if the match score is reasonable
-        if match_info['final_score'] < 0.2:  # Lowered threshold from 0.3 to 0.2 due to resampling
+        # Check if the match score is reasonable - be more lenient if we had to resample
+        score_threshold = 0.3
+        if match_info['resampling_attempts'] > 0:
+            score_threshold = max(0.2, 0.3 - 0.02 * match_info['resampling_attempts'])
+            
+        if match_info['final_score'] < score_threshold:
             if self.debug_level > 1:
-                print(f"\n[ScanMatcher] Match rejected: Score too low ({match_info['final_score']:.3f} < 0.2)")
+                print(f"\n[ScanMatcher] Match rejected: Score too low ({match_info['final_score']:.3f} < {score_threshold})")
             return False
         
         # All checks passed
@@ -1334,11 +1316,23 @@ class ImprovedScanMatchingLocalization:
                 # Add a custom legend entry for iterations
                 ax.scatter([], [], c='green', marker='x', s=50, label='ICP Iterations')
             
-            # Add match score to the plot
-            score_text = f"Match Score: {data['final_score']:.3f}"
-            ax.text(0.02, 0.98, score_text, transform=ax.transAxes, 
+            # Add match score and resampling info to the plot
+            info_text = f"Match Score: {data['final_score']:.3f}"
+            if data.get('resampling_attempts', 0) > 0:
+                info_text += f"\nResampling Attempts: {data['resampling_attempts']}"
+                
+            ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
                     va='top', ha='left', color='blue', fontsize=10,
                     bbox=dict(facecolor='white', alpha=0.7))
+            
+            # If aggressive resampling was used, also show the aggressive search radius
+            if data.get('resampling_attempts', 0) > 0:
+                aggressive_circle = plt.Circle((pose.x, pose.y), 
+                                            self.aggressive_max_correspondence_distance,
+                                            color='red', fill=False, alpha=0.2, linestyle='--')
+                ax.add_patch(aggressive_circle)
+                ax.scatter([], [], c='red', marker='o', s=0, label=f'Aggressive Search ({self.aggressive_max_correspondence_distance}m)', 
+                          linestyle='--', alpha=0.2)
         
         # Add grid and labels
         ax.grid(True)
@@ -1580,3 +1574,1027 @@ class ImprovedScanMatchingLocalization:
         
         # Close the figure to free memory
         plt.close(fig)
+
+    def visualize_map_and_scan(self, scan_x, scan_y, pose):
+        """Create a visualization of the map and current scan for debugging"""
+        import matplotlib.pyplot as plt
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Create points array from scan
+        scan_points = np.column_stack((scan_x, scan_y))
+        
+        # Transform points to world frame
+        world_points = self.transformPointsToWorld(scan_points, pose)
+        
+        # Plot the map
+        if self.map:
+            # Custom colormap
+            cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+            bounds = [0, 0.4, 0.6, 1]
+            norm = colors.BoundaryNorm(bounds, cmap.N)
+            
+            ax.imshow(
+                self.map.get_grid_for_display(),
+                cmap=cmap, norm=norm,
+                origin='lower',
+                extent=[-self.map.width/2, self.map.width/2, -self.map.height/2, self.map.height/2]
+            )
+            
+            # Count the number of occupied cells
+            try:
+                occupied_cells = np.sum(self.map.grid > self.occupancy_threshold)
+                total_cells = self.map.grid_width * self.map.grid_height
+                
+                ax.set_title(f"Map Visualization - {occupied_cells} occupied cells ({occupied_cells/total_cells*100:.2f}%)")
+            except:
+                ax.set_title("Map Visualization")
+        
+        # Plot odometry trajectory
+        odom_x = [pose.x for pose in self.odometry_trajectory]
+        odom_y = [pose.y for pose in self.odometry_trajectory]
+        ax.plot(odom_x, odom_y, 'r-', linewidth=1, alpha=0.5, label='Odometry')
+        
+        # Plot matched trajectory
+        matched_x = [pose.x for pose in self.trajectory]
+        matched_y = [pose.y for pose in self.trajectory]
+        ax.plot(matched_x, matched_y, 'g-', linewidth=1, label='Matched')
+        
+        # Plot scan points
+        ax.scatter(world_points[:, 0], world_points[:, 1], c='blue', s=3, alpha=0.5, label='Current Scan')
+        
+        # Plot the current position from both odometry and matched pose
+        if len(self.odometry_trajectory) > 0:
+            ax.scatter(self.odometry_trajectory[-1].x, self.odometry_trajectory[-1].y, 
+                      c='red', s=100, marker='*', label='Odometry Position')
+        
+        if len(self.trajectory) > 0:
+            ax.scatter(self.trajectory[-1].x, self.trajectory[-1].y, 
+                      c='green', s=100, marker='*', label='Matched Position')
+        
+        # Draw map boundaries
+        ax.axhline(y=-self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axhline(y=self.map.height/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=-self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        ax.axvline(x=self.map.width/2, color='red', linestyle='--', alpha=0.5)
+        
+        # Add search radius visualization around current matched position
+        if len(self.trajectory) > 0:
+            current_pos = self.trajectory[-1]
+            search_circle = plt.Circle((current_pos.x, current_pos.y), 
+                                      self.max_correspondence_distance,
+                                      color='blue', fill=False, alpha=0.3)
+            ax.add_patch(search_circle)
+        
+        ax.legend()
+        ax.grid(True)
+        ax.set_aspect('equal')
+        
+        plt.tight_layout()
+        
+        # Save the figure to a file
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        plt.savefig(f"map_scan_debug_{timestamp}.png", dpi=150)
+        
+        print(f"\n[ScanMatcher] Map visualization saved to map_scan_debug_{timestamp}.png")
+        
+        # Close the figure to free memory
+        plt.close(fig)
+
+def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False, 
+                      show_occupancy_grid=True, grid_resolution=0.05, save_grid=False,
+                      save_format='png', save_path='maps/', enable_scan_matching=False):
+    """
+    Animate LiDAR scans showing robot movement based on pose with interactive zooming
+    
+    Args:
+        parsed_data_list: List of parsed LiDAR data dictionaries
+        flip_x: Whether to flip the x-axis
+        flip_y: Whether to flip the y-axis
+        reverse_scan: Whether to reverse the scan direction
+        flip_theta: Whether to negate the orientation angle
+        show_occupancy_grid: Whether to show the occupancy grid
+        grid_resolution: Resolution of the occupancy grid in meters
+        save_grid: Whether to save the final occupancy grid
+        save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
+        save_path: Directory to save the grid
+        enable_scan_matching: Whether to use scan matching localization
+    """
+    if not parsed_data_list:
+        print("No data to animate.")
+        return None
+    
+    # Assuming the LiDAR scan covers 180 degrees (π radians)
+    angle_min = -math.pi/2
+    angle_max = math.pi/2
+    
+    # Find max range for consistent scaling by converting all data points
+    all_x_points = []
+    all_y_points = []
+    for parsed_data in parsed_data_list:
+        x_points, y_points = convert_scans_to_cartesian(
+            parsed_data['scan_ranges'], angle_min, angle_max, parsed_data['pose'],
+            flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
+        )
+        all_x_points.extend(x_points)
+        all_y_points.extend(y_points)
+    
+    # Calculate proper axis limits for visualization
+    x_min, x_max = min(all_x_points), max(all_x_points)
+    y_min, y_max = min(all_y_points), max(all_y_points)
+    
+    # Add some padding (20%)
+    x_padding = max(1.0, (x_max - x_min) * 0.2)
+    y_padding = max(1.0, (y_max - y_min) * 0.2)
+    
+    # Set limits with padding
+    x_min -= x_padding
+    x_max += x_padding
+    y_min -= y_padding
+    y_max += y_padding
+    
+    # Calculate grid dimensions based on data range
+    grid_width = max(20, int(math.ceil((x_max - x_min) * 1.5)))  # Make grid at least 20m wide
+    grid_height = max(20, int(math.ceil((y_max - y_min) * 1.5)))  # Make grid at least 20m tall
+    
+    # Initialize occupancy grid
+    if show_occupancy_grid:
+        occupancy_grid = OccupancyGrid(resolution=grid_resolution, 
+                                      initial_width=grid_width, 
+                                      initial_height=grid_height, expansion_factor=1.5, sensor_noise_variance=0.01)
+    else:
+        occupancy_grid = None
+    
+    # Initialize scan matching localization if enabled
+    if enable_scan_matching:
+        localizer = ImprovedScanMatchingLocalization(occupancy_grid)
+        
+        # Process sensor data to build trajectory with scan matching
+        # For the first pass, we'll use odometry for the trajectory while building the map
+        localizer.processSensorData(
+            parsed_data_list,
+            angle_min=angle_min,
+            angle_max=angle_max,
+            flip_x=flip_x,
+            flip_y=flip_y,
+            reverse_scan=reverse_scan,
+            flip_theta=flip_theta
+        )
+        
+        # If we want to improve localization, we can now run scan matching
+        # against the built map (not done in this basic implementation)
+        
+        # Extract trajectory for visualization
+        trajectory = localizer.trajectory
+        robot_path_x = [pose.x for pose in trajectory]
+        robot_path_y = [pose.y for pose in trajectory]
+    else:
+        # Use odometry-based trajectory without scan matching
+        robot_path_x = []
+        robot_path_y = []
+        for data in parsed_data_list:
+            x, y = data['pose']['x'], data['pose']['y']
+            if flip_x:
+                x = -x
+            if flip_y:
+                y = -y
+            robot_path_x.append(x)
+            robot_path_y.append(y)
+    
+    # Calculate time difference between timestamps
+    timestamps = [data['timestamp'] for data in parsed_data_list]
+    start_time = timestamps[0]
+    time_diffs = [t - start_time for t in timestamps]
+    
+    # Track the current frame index for saving the displayed state
+    current_frame_index = [0]  # Using a list to make it mutable inside nested functions
+    
+    # Create a figure with two subplots side by side if showing occupancy grid
+    if show_occupancy_grid:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 9))
+        
+        # Set up the occupancy grid image
+        # Custom colormap: white (unknown), black (occupied), light gray (free)
+        cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+        bounds = [0, 0.4, 0.6, 1]
+        norm = colors.BoundaryNorm(bounds, cmap.N)
+        
+        # Initialize the occupancy grid display
+        grid_img = ax2.imshow(occupancy_grid.get_grid_for_display(), 
+                             cmap=cmap, norm=norm, 
+                             origin='lower', 
+                             extent=[-occupancy_grid.width/2, occupancy_grid.width/2, 
+                                     -occupancy_grid.height/2, occupancy_grid.height/2])
+        
+        # Add reference grid lines
+        ax2.grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        # Create a line for robot path on the occupancy grid
+        grid_path_line, = ax2.plot([], [], 'r-', linewidth=2, label='Robot Path')
+        
+        # Also plot the starting position on the grid
+        grid_start_point = ax2.scatter([], [], c='green', s=100, marker='*', label='Start')
+        
+        # Add a star marker for the current robot position
+        grid_current_pos = ax2.scatter([], [], c='blue', s=100, marker='*', label='Current Position')
+        
+        # Add text elements for status information on the grid
+        grid_timestamp_text = ax2.text(0.02, 0.98, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
+        grid_robot_id_text = ax2.text(0.02, 0.94, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
+        grid_pose_text = ax2.text(0.02, 0.90, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
+        grid_settings_text = ax2.text(0.02, 0.86, "", transform=ax2.transAxes, va='top', ha='left', color='blue')
+        
+        # Add scan matching status text if enabled
+        if enable_scan_matching:
+            grid_scan_match_text = ax2.text(0.02, 0.82, "Scan Matching: Enabled", 
+                                           transform=ax2.transAxes, va='top', ha='left', color='green')
+        
+        # Add zoom information text
+        zoom_info_text = ax2.text(0.5, 0.02, "Left-click: Zoom in | Right-click: Zoom out | Middle-click: Reset zoom", 
+                                 transform=ax2.transAxes, va='bottom', ha='center', 
+                                 fontsize=10, color='blue', bbox=dict(facecolor='white', alpha=0.7))
+        
+        # Store original axis limits for reset
+        original_xlim = ax2.get_xlim()
+        original_ylim = ax2.get_ylim()
+        
+        # Flag to track if animation is running
+        is_running = [True]
+        
+        # Zoom factor for mouse wheel zoom
+        zoom_factor = 0.5  # How much to zoom in/out (0.5 = 50% zoom)
+        
+        # Store the current robot position for centering when following
+        current_robot_pos = [0, 0]
+        
+        # Flag to determine if we're following the robot
+        follow_robot = [True]
+        
+        # Add a Follow Robot button
+        plt.subplots_adjust(bottom=0.15)  # Make room for buttons
+        follow_button_ax = plt.axes([0.85, 0.05, 0.1, 0.04])
+        follow_button = Button(follow_button_ax, 'Follow Robot', color='lightgoldenrodyellow', hovercolor='0.975')
+        
+        # Add a Save Map button
+        save_button_ax = plt.axes([0.70, 0.05, 0.1, 0.04])
+        save_button = Button(save_button_ax, 'Save Map', color='lightblue', hovercolor='0.8')
+        
+        # Add a Scan Match Overlay button if scan matching is enabled
+        if enable_scan_matching:
+            match_overlay_button_ax = plt.axes([0.55, 0.05, 0.1, 0.04])
+            match_overlay_button = Button(match_overlay_button_ax, 'Show Match', color='lightgreen', hovercolor='0.8')
+            show_match_overlay = [False]  # Flag to track if match overlay should be shown
+        
+        def toggle_follow(event):
+            follow_robot[0] = not follow_robot[0]
+            follow_button.label.set_text('Following' if follow_robot[0] else 'Not Following')
+            
+        def save_current_map(event):
+            if not show_occupancy_grid:
+                print("Cannot save map - occupancy grid is disabled.")
+                return
+                
+            # Create the save directory if it doesn't exist
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            
+            # Generate a timestamp-based filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            base_filename = os.path.join(save_path, f"occupancy_grid_{timestamp}")
+            
+            # Get the current path based on the frame we're displaying
+            current_frame = current_frame_index[0]
+            displayed_path_x = robot_path_x[:current_frame+1]
+            displayed_path_y = robot_path_y[:current_frame+1]
+            
+            # Create path coordinates for saving
+            displayed_path_coords = list(zip(displayed_path_x, displayed_path_y))
+            
+            # Get start and current positions from displayed path
+            start_pos = (displayed_path_x[0], displayed_path_y[0]) if len(displayed_path_x) > 0 else None
+            current_pos = (displayed_path_x[-1], displayed_path_y[-1]) if len(displayed_path_x) > 0 else None
+            
+            # Save the grid with currently displayed robot path and positions
+            occupancy_grid.save_to_file(
+                base_filename, 
+                format=save_format, 
+                include_metadata=True,
+                robot_path=displayed_path_coords,
+                start_position=start_pos,
+                current_position=current_pos
+            )
+            
+            print(f"\nOccupancy grid map saved to {base_filename}.{save_format} with current robot path and positions")
+        
+        def toggle_match_overlay(event):
+            if not enable_scan_matching:
+                return
+                
+            show_match_overlay[0] = not show_match_overlay[0]
+            match_overlay_button.label.set_text('Hide Match' if show_match_overlay[0] else 'Show Match')
+            
+            # If showing the overlay, create a new figure
+            if show_match_overlay[0]:
+                # Get current frame
+                current_frame = current_frame_index[0]
+                
+                # Get current scan data
+                scan_data = parsed_data_list[current_frame]
+                
+                # Convert scan to Cartesian coordinates
+                scan_x, scan_y = convert_scans_to_cartesian(
+                    scan_data['scan_ranges'], angle_min, angle_max, scan_data['pose'],
+                    flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
+                )
+                
+                # Get current pose from trajectory
+                current_pose = localizer.trajectory[current_frame]
+                
+                # Create a new figure for the overlay
+                overlay_fig = plt.figure(figsize=(10, 10))
+                overlay_ax = overlay_fig.add_subplot(111)
+                
+                # Plot the overlay using the localizer's function
+                localizer.plotMatchOverlay(scan_x, scan_y, current_pose, ax=overlay_ax)
+                
+                plt.tight_layout()
+                plt.show()
+            
+        follow_button.on_clicked(toggle_follow)
+        save_button.on_clicked(save_current_map)
+        
+        if enable_scan_matching:
+            match_overlay_button.on_clicked(toggle_match_overlay)
+        
+        # Define click event handler for zooming
+        def on_click(event):
+            # Only process clicks in the map axis
+            if event.inaxes != ax2:
+                return
+                
+            # Get click coordinates
+            x, y = event.xdata, event.ydata
+            
+            # Current axis limits
+            xmin, xmax = ax2.get_xlim()
+            ymin, ymax = ax2.get_ylim()
+            width = xmax - xmin
+            height = ymax - ymin
+            
+            # Left-click: Zoom in
+            if event.button == 1:  # Left click
+                # Zoom in by 50% around the clicked point
+                new_width = width * zoom_factor
+                new_height = height * zoom_factor
+                ax2.set_xlim(x - new_width/2, x + new_width/2)
+                ax2.set_ylim(y - new_height/2, y + new_height/2)
+                follow_robot[0] = False  # Turn off follow mode when manually zooming
+                follow_button.label.set_text('Not Following')
+                
+            # Right-click: Zoom out
+            elif event.button == 3:  # Right click
+                # Zoom out by 200%
+                new_width = width / zoom_factor
+                new_height = height / zoom_factor
+                # Center on the clicked point
+                ax2.set_xlim(x - new_width/2, x + new_width/2)
+                ax2.set_ylim(y - new_height/2, y + new_height/2)
+                
+            # Middle-click: Reset zoom
+            elif event.button == 2:  # Middle click
+                ax2.set_xlim(original_xlim)
+                ax2.set_ylim(original_ylim)
+                
+            # Redraw the figure
+            fig.canvas.draw_idle()
+            
+        # Connect the click event handler
+        fig.canvas.mpl_connect('button_press_event', on_click)
+        
+        # Set occupancy grid plot properties
+        ax2.set_title('Occupancy Grid Map')
+        ax2.set_xlabel('X (meters)')
+        ax2.set_ylabel('Y (meters)')
+        ax2.set_aspect('equal')
+        
+        # Add legend to grid map
+        ax2.legend(loc='upper right')
+        
+        # Set the LiDAR scan plot in the first subplot
+        ax = ax1
+    else:
+        fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create a scatter plot for LiDAR points
+    scatter = ax.scatter([], [], c='blue', s=3, label='LiDAR Points')
+    
+    # Create a scatter plot for robot position
+    robot_pos = ax.scatter([], [], c='red', s=100, marker='*', label='Robot Position')
+    
+    # Create a line for robot path
+    path_line, = ax.plot([], [], 'g-', linewidth=2, label='Robot Path')
+    
+    # Initialize text objects for information display
+    timestamp_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, va='top', ha='left')
+    robot_id_text = ax.text(0.02, 0.94, "", transform=ax.transAxes, va='top', ha='left')
+    pose_text = ax.text(0.02, 0.90, "", transform=ax.transAxes, va='top', ha='left')
+    settings_text = ax.text(0.02, 0.86, "", transform=ax.transAxes, va='top', ha='left')
+    
+    # Add scan matching status if enabled
+    if enable_scan_matching:
+        scan_match_text = ax.text(0.02, 0.82, "Scan Matching: Enabled", 
+                                 transform=ax.transAxes, va='top', ha='left', color='green')
+    
+    # Initialize arrow for robot orientation
+    arrow = None
+    
+    def init():
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.grid(True)
+        ax.set_aspect('equal')
+        ax.set_xlabel('X (meters)')
+        ax.set_ylabel('Y (meters)')
+        ax.set_title('2D LiDAR Scan Visualization')
+        ax.legend(loc='upper right')
+        
+        # Show orientation settings
+        settings_str = f"Settings: flip_x={flip_x}, flip_y={flip_y}, reverse_scan={reverse_scan}, flip_theta={flip_theta}"
+        settings_text.set_text(settings_str)
+        
+        # Set robot ID text
+        robot_id = parsed_data_list[0]['robot_id'] if parsed_data_list else "Unknown"
+        robot_id_str = f"Robot ID: {robot_id}"
+        robot_id_text.set_text(robot_id_str)
+        
+        if show_occupancy_grid:
+            # Initialize the grid path with the starting point
+            if len(robot_path_x) > 0:
+                grid_start_point.set_offsets([[robot_path_x[0], robot_path_y[0]]])
+                grid_current_pos.set_offsets([[robot_path_x[0], robot_path_y[0]]])
+            
+            # Initialize text on grid
+            grid_settings_text.set_text(settings_str)
+            grid_robot_id_text.set_text(robot_id_str)
+            
+            return_values = [scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, settings_text, 
+                           grid_img, grid_path_line, grid_start_point, grid_current_pos, grid_timestamp_text, 
+                           grid_robot_id_text, grid_pose_text, grid_settings_text]
+            
+            # Add scan matching text to return values if enabled
+            if enable_scan_matching:
+                return_values.append(scan_match_text)
+                return_values.append(grid_scan_match_text)
+            
+            return tuple(return_values)
+        else:
+            return_values = [scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, settings_text]
+            
+            # Add scan matching text to return values if enabled
+            if enable_scan_matching:
+                return_values.append(scan_match_text)
+            
+            return tuple(return_values)
+    
+    def update(frame):
+        nonlocal arrow
+        
+        # Update the current frame index
+        current_frame_index[0] = frame
+        
+        parsed_data = parsed_data_list[frame]
+        
+        # Convert current scan to Cartesian coordinates with configured orientation
+        x_points, y_points = convert_scans_to_cartesian(
+            parsed_data['scan_ranges'], angle_min, angle_max, parsed_data['pose'],
+            flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
+        )
+        
+        # Update LiDAR points
+        scatter.set_offsets(np.column_stack((x_points, y_points)))
+        
+        # Get transformed robot pose
+        if enable_scan_matching and frame < len(localizer.trajectory):
+            # Use the scan-matched pose from trajectory
+            robot_x = localizer.trajectory[frame].x
+            robot_y = localizer.trajectory[frame].y
+            robot_theta = localizer.trajectory[frame].theta
+        else:
+            # Use odometry-based pose
+            robot_x, robot_y = parsed_data['pose']['x'], parsed_data['pose']['y']
+            if flip_x:
+                robot_x = -robot_x
+            if flip_y:
+                robot_y = -robot_y
+            robot_theta = parsed_data['pose']['theta']
+            if flip_theta:
+                robot_theta = -robot_theta
+        
+        # Store current robot position for zoom centering
+        if show_occupancy_grid:
+            current_robot_pos[0] = robot_x
+            current_robot_pos[1] = robot_y
+            
+            # If following robot is enabled, center the view on the robot
+            if follow_robot[0]:
+                # Get current zoom level (width and height)
+                xmin, xmax = ax2.get_xlim()
+                ymin, ymax = ax2.get_ylim()
+                width = xmax - xmin
+                height = ymax - ymin
+                
+                # Center on robot position while maintaining zoom level
+                ax2.set_xlim(robot_x - width/2, robot_x + width/2)
+                ax2.set_ylim(robot_y - height/2, robot_y + height/2)
+        
+        # Update robot position
+        robot_pos.set_offsets([[robot_x, robot_y]])
+        
+        # Update robot path
+        path_line.set_data(robot_path_x[:frame+1], robot_path_y[:frame+1])
+        
+        # Update text information
+        elapsed_time = time_diffs[frame]
+        timestamp_str = f"Time: {elapsed_time:.3f}s"
+        timestamp_text.set_text(timestamp_str)
+        
+        # Show robot ID
+        robot_id_str = f"Robot ID: {parsed_data['robot_id']}"
+        robot_id_text.set_text(robot_id_str)
+        
+        # Show pose values
+        if enable_scan_matching:
+            # Show both odometry and scan-matched pose
+            odom_pose_str = f"Odometry Pose: x={parsed_data['pose']['x']:.3f}, y={parsed_data['pose']['y']:.3f}, θ={parsed_data['pose']['theta']:.3f}"
+            matched_pose_str = f"Matched Pose: x={robot_x:.3f}, y={robot_y:.3f}, θ={robot_theta:.3f}"
+            pose_text.set_text(f"{odom_pose_str}\n{matched_pose_str}")
+        else:
+            # Show only odometry pose
+            pose_str = f"Pose: x={parsed_data['pose']['x']:.3f}, y={parsed_data['pose']['y']:.3f}, θ={parsed_data['pose']['theta']:.3f}"
+            pose_text.set_text(pose_str)
+        
+        # Update robot orientation arrow
+        if arrow:
+            arrow.remove()
+        
+        # Use the appropriate orientation
+        arrow_length = 0.5
+        dx = arrow_length * math.cos(robot_theta)
+        dy = arrow_length * math.sin(robot_theta)
+            
+        arrow = ax.arrow(robot_x, robot_y, dx, dy, 
+                        head_width=0.1, head_length=0.1, fc='red', ec='red')
+        
+        # Update occupancy grid if enabled
+        if show_occupancy_grid:
+            # Update the grid with current scan if not using pre-built map
+            if not enable_scan_matching or frame == 0:
+                occupancy_grid.update_grid(robot_x, robot_y, x_points, y_points)
+            
+            # Update the grid image
+            grid_img.set_data(occupancy_grid.get_grid_for_display())
+            
+            # Update the robot path on the grid map
+            grid_path_line.set_data(robot_path_x[:frame+1], robot_path_y[:frame+1])
+            
+            # Update the current position marker
+            grid_current_pos.set_offsets([[robot_x, robot_y]])
+            
+            # Update text information on grid
+            grid_timestamp_text.set_text(timestamp_str)
+            grid_robot_id_text.set_text(robot_id_str)
+            
+            if enable_scan_matching:
+                grid_pose_text.set_text(matched_pose_str)
+            else:
+                grid_pose_text.set_text(pose_str)
+            
+            return_values = [scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, 
+                           settings_text, arrow, grid_img, grid_path_line, grid_current_pos, grid_timestamp_text, 
+                           grid_robot_id_text, grid_pose_text, grid_settings_text]
+            
+            # Add scan matching text to return values if enabled
+            if enable_scan_matching:
+                return_values.append(scan_match_text)
+                return_values.append(grid_scan_match_text)
+            
+            return tuple(return_values)
+        else:
+            return_values = [scatter, robot_pos, path_line, timestamp_text, robot_id_text, pose_text, 
+                            settings_text, arrow]
+            
+            # Add scan matching text to return values if enabled
+            if enable_scan_matching:
+                return_values.append(scan_match_text)
+            
+            return tuple(return_values)
+    
+    # Create animation with faster frame rate for smoother visualization
+    animation = FuncAnimation(fig, update, frames=len(parsed_data_list), 
+                             init_func=init, interval=10, blit=False)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Note: The save functionality is now handled by the Save Map button
+    # If you still want to automatically save at the end, you can use:
+    # if save_grid and show_occupancy_grid:
+    #     save_current_map(None)  # Call the save function without an event
+    
+    return animation
+
+def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_grid=True, 
+                             grid_resolution=0.05, save_grid=True, save_format='all',
+                             enable_scan_matching=True):
+    """
+    Main function to visualize LiDAR data in real-time with occupancy grid mapping and scan matching
+    
+    Args:
+        file_path: Path to the LiDAR data file
+        max_entries: Maximum number of entries to read from the file
+        show_occupancy_grid: Whether to show the occupancy grid visualization
+        grid_resolution: Resolution of the occupancy grid in meters (smaller = more detail but slower)
+        save_grid: Whether to save the final occupancy grid map to a file
+        save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
+        enable_scan_matching: Whether to use scan matching localization algorithm
+    """
+    print(f"Reading LiDAR data from: {file_path}")
+    
+    # Check if file exists
+    if not os.path.exists(file_path):
+        print(f"Error: File {file_path} does not exist.")
+        return
+    
+    # Read the data from file
+    parsed_data_list = read_lidar_data_from_file(file_path, max_entries)
+    
+    if not parsed_data_list:
+        print("No data was read from the file.")
+        return
+    
+    # Display data summary
+    first_timestamp = parsed_data_list[0]['timestamp']
+    last_timestamp = parsed_data_list[-1]['timestamp']
+    duration = last_timestamp - first_timestamp
+    
+    print(f"\nData Summary:")
+    print(f"  Number of entries: {len(parsed_data_list)}")
+    print(f"  Robot ID: {parsed_data_list[0]['robot_id']}")
+    print(f"  Data duration: {duration:.2f} seconds")
+    
+    if show_occupancy_grid:
+        print(f"  Starting visualization with occupancy grid mapping (resolution: {grid_resolution}m)...")
+        if save_grid:
+            print(f"  The final occupancy grid will be saved in '{save_format}' format")
+    else:
+        print(f"  Starting visualization with orientation correction...")
+    
+    # Assuming the LiDAR scan covers 180 degrees (π radians)
+    angle_min = -math.pi/2
+    angle_max = math.pi/2
+    
+    # Find max range for consistent scaling by converting all data points
+    all_x_points = []
+    all_y_points = []
+    for parsed_data in parsed_data_list:
+        x_points, y_points = convert_scans_to_cartesian(
+            parsed_data['scan_ranges'], angle_min, angle_max, parsed_data['pose'],
+            flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False
+        )
+        all_x_points.extend(x_points)
+        all_y_points.extend(y_points)
+    
+    # Calculate proper axis limits for visualization
+    x_min, x_max = min(all_x_points), max(all_x_points)
+    y_min, y_max = min(all_y_points), max(all_y_points)
+    
+    # Add some padding (20%)
+    x_padding = max(1.0, (x_max - x_min) * 0.2)
+    y_padding = max(1.0, (y_max - y_min) * 0.2)
+    
+    # Set limits with padding
+    x_min -= x_padding
+    x_max += x_padding
+    y_min -= y_padding
+    y_max += y_padding
+    
+    # Calculate grid dimensions based on data range
+    grid_width = max(20, int(math.ceil((x_max - x_min) * 1.5)))  # Make grid at least 20m wide
+    grid_height = max(20, int(math.ceil((y_max - y_min) * 1.5)))  # Make grid at least 20m tall
+    
+    # Initialize occupancy grid
+    if show_occupancy_grid:
+        occupancy_grid = OccupancyGrid(resolution=grid_resolution, 
+                                      initial_width=grid_width, 
+                                      initial_height=grid_height, expansion_factor=1.5, sensor_noise_variance=0.01)
+    else:
+        occupancy_grid = None
+    
+    # Initialize scan matching localization if enabled
+    if enable_scan_matching:
+        print(f"  Using improved ICP scan matching algorithm with motion validation")
+        localizer = ImprovedScanMatchingLocalization(occupancy_grid, debug_level=1)
+        
+        # Process sensor data to build trajectory with scan matching
+        localizer.processSensorData(
+            parsed_data_list,
+            angle_min=angle_min,
+            angle_max=angle_max,
+            flip_x=False,
+            flip_y=False,
+            reverse_scan=True,
+            flip_theta=False
+        )
+        
+        # Extract trajectory for visualization
+        trajectory = localizer.trajectory
+        robot_path_x = [pose.x for pose in trajectory]
+        robot_path_y = [pose.y for pose in trajectory]
+        
+        # Also keep track of odometry trajectory for comparison
+        odometry_trajectory = localizer.odometry_trajectory
+        odometry_path_x = [pose.x for pose in odometry_trajectory]
+        odometry_path_y = [pose.y for pose in odometry_trajectory]
+    else:
+        # Use odometry-based trajectory without scan matching
+        print(f"  Scan matching is DISABLED - using raw odometry")
+        robot_path_x = []
+        robot_path_y = []
+        for data in parsed_data_list:
+            x, y = data['pose']['x'], data['pose']['y']
+            robot_path_x.append(x)
+            robot_path_y.append(y)
+        odometry_path_x = robot_path_x
+        odometry_path_y = robot_path_y
+    
+    # Create output directory for maps
+    maps_dir = "maps"
+    if save_grid and not os.path.exists(maps_dir):
+        try:
+            os.makedirs(maps_dir)
+            print(f"  Created directory for maps: {maps_dir}/")
+        except Exception as e:
+            print(f"  Error creating maps directory: {e}")
+    
+    # Create a figure with two subplots side by side if showing occupancy grid
+    if show_occupancy_grid:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 9))
+        
+        # Set up the occupancy grid image
+        # Custom colormap: white (unknown), black (occupied), light gray (free)
+        cmap = colors.ListedColormap(['white', 'lightgray', 'black'])
+        bounds = [0, 0.4, 0.6, 1]
+        norm = colors.BoundaryNorm(bounds, cmap.N)
+        
+        # Initialize the occupancy grid display
+        grid_img = ax2.imshow(occupancy_grid.get_grid_for_display(), 
+                             cmap=cmap, norm=norm, 
+                             origin='lower', 
+                             extent=[-occupancy_grid.width/2, occupancy_grid.width/2, 
+                                     -occupancy_grid.height/2, occupancy_grid.height/2])
+        
+        # Add reference grid lines
+        ax2.grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+        
+        # Create a line for robot path on the occupancy grid
+        grid_path_line, = ax2.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label='Matched Path')
+        
+        # Create a line for odometry path if scan matching is enabled
+        if enable_scan_matching:
+            grid_odom_line, = ax2.plot(odometry_path_x, odometry_path_y, 'r--', linewidth=1, alpha=0.6, label='Odometry Path')
+        
+        # Also plot the starting position on the grid
+        if len(robot_path_x) > 0:
+            grid_start_point = ax2.scatter(robot_path_x[0], robot_path_y[0], c='green', s=100, marker='*', label='Start')
+            grid_current_pos = ax2.scatter(robot_path_x[-1], robot_path_y[-1], c='blue', s=100, marker='*', label='End')
+        
+        # Add a button for visualizing the ICP process if scan matching is enabled
+        if enable_scan_matching:
+            plt.subplots_adjust(bottom=0.15)  # Make room for buttons
+            
+            # Add a Visualize ICP Process button
+            icp_viz_button_ax = plt.axes([0.55, 0.05, 0.15, 0.04])
+            icp_viz_button = Button(icp_viz_button_ax, 'Visualize ICP Process', color='lightgreen', hovercolor='0.8')
+            
+            def visualize_icp_process(event):
+                if not enable_scan_matching:
+                    print("ICP visualization is only available when scan matching is enabled.")
+                    return
+                
+                # Create ICP process visualization
+                fig = localizer.visualizeIcpProcess()
+                if fig:
+                    plt.figure(fig.number)
+                    plt.show()
+                else:
+                    print("No ICP visualization data available.")
+            
+            icp_viz_button.on_clicked(visualize_icp_process)
+        
+        # Add a Save Map button
+        save_button_ax = plt.axes([0.75, 0.05, 0.1, 0.04])
+        save_button = Button(save_button_ax, 'Save Map', color='lightblue', hovercolor='0.8')
+        
+        def save_map(event):
+            if not show_occupancy_grid:
+                print("Cannot save map - occupancy grid is disabled.")
+                return
+                
+            # Create the save directory if it doesn't exist
+            if not os.path.exists(maps_dir):
+                os.makedirs(maps_dir)
+            
+            # Generate a timestamp-based filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            base_filename = os.path.join(maps_dir, f"occupancy_grid_{timestamp}")
+            
+            # Create path coordinates for saving
+            robot_path_coords = list(zip(robot_path_x, robot_path_y))
+            
+            # Get start and current positions from path
+            start_pos = (robot_path_x[0], robot_path_y[0]) if len(robot_path_x) > 0 else None
+            current_pos = (robot_path_x[-1], robot_path_y[-1]) if len(robot_path_x) > 0 else None
+            
+            # Save the grid with robot path and positions
+            occupancy_grid.save_to_file(
+                base_filename, 
+                format=save_format, 
+                include_metadata=True,
+                robot_path=robot_path_coords,
+                start_position=start_pos,
+                current_position=current_pos
+            )
+            
+            print(f"\nOccupancy grid map saved to {base_filename}.{save_format} with robot path and positions")
+        
+        save_button.on_clicked(save_map)
+        
+        # Add a Compare Paths button if scan matching is enabled
+        if enable_scan_matching:
+            compare_button_ax = plt.axes([0.90, 0.05, 0.08, 0.04])
+            compare_button = Button(compare_button_ax, 'Compare Paths', color='lightcoral', hovercolor='0.8')
+            
+            def compare_paths(event):
+                # Create a figure to compare odometry and matched paths
+                compare_fig, compare_ax = plt.subplots(figsize=(10, 10))
+                
+                # Plot the map
+                if show_occupancy_grid:
+                    compare_ax.imshow(
+                        occupancy_grid.get_grid_for_display(),
+                        cmap=cmap, norm=norm,
+                        origin='lower',
+                        extent=[-occupancy_grid.width/2, occupancy_grid.width/2, 
+                               -occupancy_grid.height/2, occupancy_grid.height/2]
+                    )
+                
+                # Plot both paths
+                compare_ax.plot(odometry_path_x, odometry_path_y, 'r-', linewidth=2, label='Odometry Path')
+                compare_ax.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label='Matched Path')
+                
+                # Plot start and end points
+                compare_ax.scatter(odometry_path_x[0], odometry_path_y[0], c='green', s=100, marker='*', label='Start')
+                compare_ax.scatter(odometry_path_x[-1], odometry_path_y[-1], c='red', s=100, marker='*', label='Odometry End')
+                compare_ax.scatter(robot_path_x[-1], robot_path_y[-1], c='blue', s=100, marker='*', label='Matched End')
+                
+                # Add grid, labels, and legend
+                compare_ax.grid(True)
+                compare_ax.set_aspect('equal')
+                compare_ax.set_xlabel('X (meters)')
+                compare_ax.set_ylabel('Y (meters)')
+                compare_ax.set_title('Odometry vs. Scan-Matched Path Comparison')
+                compare_ax.legend(loc='upper right')
+                
+                plt.tight_layout()
+                plt.show()
+            
+            compare_button.on_clicked(compare_paths)
+        
+        # Set occupancy grid plot properties
+        ax2.set_title('Occupancy Grid Map')
+        ax2.set_xlabel('X (meters)')
+        ax2.set_ylabel('Y (meters)')
+        ax2.set_aspect('equal')
+        
+        # Add legend to grid map
+        ax2.legend(loc='upper right')
+        
+        # Set the LiDAR scan plot in the first subplot
+        ax = ax1
+    else:
+        fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create a scatter plot for LiDAR points
+    scan_x, scan_y = convert_scans_to_cartesian(
+        parsed_data_list[-1]['scan_ranges'], angle_min, angle_max, parsed_data_list[-1]['pose'],
+        flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False
+    )
+    scatter = ax.scatter(scan_x, scan_y, c='blue', s=3, label='LiDAR Points')
+    
+    # Create a scatter plot for robot position
+    last_x = robot_path_x[-1] if robot_path_x else 0
+    last_y = robot_path_y[-1] if robot_path_y else 0
+    robot_pos = ax.scatter(last_x, last_y, c='red', s=100, marker='*', label='Final Position')
+    
+    # Create a line for robot path
+    path_line, = ax.plot(robot_path_x, robot_path_y, 'g-', linewidth=2, label='Robot Path')
+    
+    # Create a line for odometry path if scan matching is enabled
+    if enable_scan_matching:
+        odom_line, = ax.plot(odometry_path_x, odometry_path_y, 'r--', linewidth=1, alpha=0.6, label='Odometry Path')
+    
+    # Add scan matching status if enabled
+    if enable_scan_matching:
+        match_text = ax.text(0.02, 0.98, "Using Improved ICP Scan Matching", 
+                            transform=ax.transAxes, va='top', ha='left', 
+                            color='green', fontsize=10,
+                            bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add grid and labels
+    ax.grid(True)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (meters)')
+    ax.set_ylabel('Y (meters)')
+    ax.set_title('2D LiDAR Scan Visualization')
+    
+    # Set axis limits
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    
+    # Add legend
+    ax.legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # If save_grid is enabled, save the final map
+    if save_grid and show_occupancy_grid:
+        # Generate a timestamp-based filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        base_filename = os.path.join(maps_dir, f"final_map_{timestamp}")
+        
+        # Create path coordinates for saving
+        robot_path_coords = list(zip(robot_path_x, robot_path_y))
+        
+        # Get start and current positions from path
+        start_pos = (robot_path_x[0], robot_path_y[0]) if len(robot_path_x) > 0 else None
+        current_pos = (robot_path_x[-1], robot_path_y[-1]) if len(robot_path_x) > 0 else None
+        
+        # Save the grid with robot path and positions
+        saved_files = occupancy_grid.save_to_file(
+            base_filename, 
+            format=save_format, 
+            include_metadata=True,
+            robot_path=robot_path_coords,
+            start_position=start_pos,
+            current_position=current_pos
+        )
+        
+        print(f"\nFinal occupancy grid map saved to:")
+        for file in saved_files:
+            print(f"  - {file}")
+def main():
+    """
+    Main function to parse arguments and run the visualization
+    """
+    import argparse
+    
+    # Create argument parser
+    parser = argparse.ArgumentParser(description='LiDAR Visualization and Localization')
+    
+    # Add arguments
+    parser.add_argument('--file', type=str, default="../dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
+                       help='Path to the LiDAR data file')
+    parser.add_argument('--max_entries', type=int, default=50,
+                       help='Maximum number of entries to read from the file')
+    parser.add_argument('--grid', action='store_true', default=True,
+                       help='Enable occupancy grid mapping')
+    parser.add_argument('--resolution', type=float, default=0.05,
+                       help='Resolution of the occupancy grid in meters')
+    parser.add_argument('--save', action='store_true', default=True,
+                       help='Save the final occupancy grid map')
+    parser.add_argument('--format', type=str, default='png', choices=['png', 'npy', 'csv', 'all'],
+                       help='Format to save the grid')
+    parser.add_argument('--scan_matching', action='store_true', default=True,
+                       help='Enable scan matching localization algorithm')
+    parser.add_argument('--debug', type=int, default=1, choices=[0, 1, 2, 3],
+                       help='Debug level (0=none, 1=basic, 2=detailed, 3=verbose)')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Run the visualization
+    visualize_lidar_data_realtime(
+        file_path=args.file,
+        max_entries=args.max_entries,
+        show_occupancy_grid=args.grid,
+        grid_resolution=args.resolution,
+        save_grid=args.save,
+        save_format=args.format,
+        enable_scan_matching=args.scan_matching
+    )
+
+# Main execution
+if __name__ == "__main__":
+    main()

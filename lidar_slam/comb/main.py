@@ -228,45 +228,149 @@ def animate_lidar_data_realtime(file_path, max_entries=200, flip_x=False, flip_y
             print(f"\nOccupancy grid map saved to {base_filename}.{save_format} with current robot path and positions")
         
         def toggle_match_overlay(event):
+            """
+            Toggle the scan match overlay visualization
+            
+            This function shows a detailed visualization of how the current LiDAR scan
+            is being matched to the occupancy grid map using the scan matching algorithm.
+            It provides insights into the quality of the match and the matching process.
+            """
             if not enable_scan_matching:
                 return
-                
+                    
             show_match_overlay[0] = not show_match_overlay[0]
             match_overlay_button.label.set_text('Hide Match' if show_match_overlay[0] else 'Show Match')
             
             # If showing the overlay, create a new figure
             if show_match_overlay[0]:
-                # Get current frame
-                current_frame = current_frame_index[0]
-                
-                # Get current scan data
-                scan_data = parsed_data_list[current_frame]
-                
-                # Convert scan to Cartesian coordinates
-                scan_x, scan_y = convert_scans_to_cartesian(
-                    scan_data['scan_ranges'], angle_min, angle_max, scan_data['pose'],
-                    flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
-                )
-                
-                # Get current pose from trajectory
-                current_pose = localizer.trajectory[current_frame]
-                
-                # Create a new figure for the overlay
-                overlay_fig = plt.figure(figsize=(10, 10))
-                overlay_ax = overlay_fig.add_subplot(111)
-                
-                # Plot the overlay using the localizer's function
-                localizer.plotMatchOverlay(scan_x, scan_y, current_pose, ax=overlay_ax, show_iterations=True)
-                
-                plt.tight_layout()
-                plt.show()
+                try:
+                    # Get current frame
+                    current_frame = current_frame_index[0]
+                    
+                    # Get current scan data
+                    scan_data = parsed_data_list[current_frame]
+                    
+                    # Convert scan to Cartesian coordinates
+                    scan_x, scan_y = convert_scans_to_cartesian(
+                        scan_data['scan_ranges'], angle_min, angle_max, scan_data['pose'],
+                        flip_x=flip_x, flip_y=flip_y, reverse_scan=reverse_scan, flip_theta=flip_theta
+                    )
+                    
+                    # Get current pose from trajectory
+                    if current_frame < len(localizer.trajectory):
+                        current_pose = localizer.trajectory[current_frame]
+                    else:
+                        print("Warning: Current frame exceeds trajectory length.")
+                        current_pose = localizer.trajectory[-1] if localizer.trajectory else None
+                    
+                    if current_pose is None:
+                        print("Error: No valid pose available for scan matching visualization.")
+                        return
+                    
+                    # Create a new figure for the overlay
+                    overlay_fig = plt.figure(figsize=(12, 10))
+                    overlay_ax = overlay_fig.add_subplot(111)
+                    
+                    # Add a title with detailed info
+                    overlay_ax.set_title(f"Scan-Map Match Overlay (Frame {current_frame+1}/{len(parsed_data_list)})",
+                                    fontsize=14, fontweight='bold')
+                    
+                    # Get match info if available
+                    match_info = None
+                    if hasattr(localizer, 'current_visualization_data'):
+                        match_info = localizer.current_visualization_data
+                    
+                    # Plot the overlay using the localizer's function
+                    localizer.plotMatchOverlay(scan_x, scan_y, current_pose, ax=overlay_ax, show_iterations=True)
+                    
+                    # Add more detailed information about the match
+                    match_quality_text = ""
+                    if match_info and 'final_score' in match_info:
+                        score = match_info['final_score']
+                        match_quality_text = f"Match Score: {score:.4f}"
+                        
+                        # Add color coding based on match quality
+                        color = 'green' if score > 0.7 else 'orange' if score > 0.4 else 'red'
+                        quality = 'Excellent' if score > 0.7 else 'Good' if score > 0.4 else 'Poor'
+                        match_quality_text += f" ({quality})"
+                    else:
+                        # If no match info, try to calculate a score
+                        match_score = localizer.scoreFinalMatch(
+                            np.column_stack((scan_x, scan_y)), current_pose
+                        )
+                        match_quality_text = f"Match Score: {match_score:.4f}"
+                        
+                        # Add color coding based on match quality
+                        color = 'green' if match_score > 0.7 else 'orange' if match_score > 0.4 else 'red'
+                        quality = 'Excellent' if match_score > 0.7 else 'Good' if match_score > 0.4 else 'Poor'
+                        match_quality_text += f" ({quality})"
+                    
+                    # Add match quality text
+                    overlay_ax.text(0.02, 0.98, match_quality_text, transform=overlay_ax.transAxes,
+                                va='top', ha='left', fontsize=12, color=color,
+                                bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'))
+                    
+                    # Add a legend explaining the visualization elements
+                    handles = [
+                        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=8, label='LiDAR Points'),
+                        plt.Line2D([0], [0], marker='*', color='w', markerfacecolor='blue', markersize=12, label='Robot Position'),
+                        plt.Line2D([0], [0], color='blue', lw=2, linestyle='--', label='Search Radius'),
+                        plt.Rectangle((0, 0), 1, 1, fc='white', label='Unknown Space'),
+                        plt.Rectangle((0, 0), 1, 1, fc='lightgray', label='Free Space'),
+                        plt.Rectangle((0, 0), 1, 1, fc='black', label='Occupied Space')
+                    ]
+                    
+                    # Add iteration points if we're showing iterations
+                    if match_info and 'iterations' in match_info and match_info['iterations']:
+                        handles.append(plt.Line2D([0], [0], marker='x', color='w', markerfacecolor='green', 
+                                                markersize=8, label='ICP Iterations'))
+                    
+                    overlay_ax.legend(handles=handles, loc='upper right', bbox_to_anchor=(1, 0.98))
+                    
+                    # Add instructions at the bottom
+                    instruction_text = "Close this window to return to the main visualization."
+                    overlay_ax.text(0.5, 0.01, instruction_text, transform=overlay_ax.transAxes,
+                                va='bottom', ha='center', fontsize=10,
+                                bbox=dict(facecolor='white', alpha=0.8))
+                    
+                    # Create a tight layout and show
+                    plt.tight_layout()
+                    plt.show(block=False)  # Use non-blocking mode to allow continued interaction
+                    
+                except Exception as e:
+                    print(f"Error showing scan match overlay: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_match_overlay[0] = False
+                    match_overlay_button.label.set_text('Show Match')
             
         follow_button.on_clicked(toggle_follow)
         save_button.on_clicked(save_current_map)
         
         if enable_scan_matching:
             match_overlay_button.on_clicked(toggle_match_overlay)
-        
+            plt.subplots_adjust(bottom=0.15)  # Make room for buttons
+
+            # Add a Visualize ICP Process button
+            icp_viz_button_ax = plt.axes([0.35, 0.05, 0.15, 0.04])
+            icp_viz_button = Button(icp_viz_button_ax, 'Visualize ICP Process', color='lightgray', hovercolor='0.8')
+
+            def visualize_icp_process(event):
+                if not enable_scan_matching:
+                    print("ICP visualization is only available when scan matching is enabled.")
+                    return
+                
+                # Create ICP process visualization
+                fig = localizer.visualizeIcpProcess()
+                if fig:
+                    plt.figure(fig.number)
+                    plt.show(block=False)  # Non-blocking so animation continues
+                    plt.show()
+                else:
+                    print("No ICP visualization data available.")
+            
+            icp_viz_button.on_clicked(visualize_icp_process)
+                
         # Define click event handler for zooming
         def on_click(event):
             # Only process clicks in the map axis
@@ -875,7 +979,7 @@ def main():
     # Add arguments
     parser.add_argument('--file', type=str, default="../dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=900,
+    parser.add_argument('--max_entries', type=int, default=200,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
