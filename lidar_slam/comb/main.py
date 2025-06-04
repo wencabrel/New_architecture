@@ -460,9 +460,9 @@ def main():
     parser = argparse.ArgumentParser(description='LiDAR Visualization, Localization, and Loop Closure')
     
     # Add arguments
-    parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_basement_loop_fast_speed_processed_reduced180.clf",
+    parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=4000,
+    parser.add_argument('--max_entries', type=int, default=3000,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')

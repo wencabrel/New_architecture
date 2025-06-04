@@ -15,8 +15,8 @@ class LoopClosureDetector:
     """
     Loop closure detector using Scan Context descriptors and ICP verification
     """
-    def __init__(self, distance_threshold=2.0, similarity_threshold=0.7, 
-                 min_loop_size=50, descriptor_size=60):
+    def __init__(self, distance_threshold=4.0, similarity_threshold=0.5, 
+                 min_loop_size=50, descriptor_size=30):
         """
         Initialize the loop closure detector
         
@@ -44,7 +44,7 @@ class LoopClosureDetector:
         self.current_match_data = None
         
         # Performance optimization - only check some frames
-        self.check_interval = 5  # Only check every 5 frames
+        self.check_interval = 3  # Only check every 5 frames
         
     def create_scan_descriptor(self, scan_x, scan_y, robot_pose):
         """
@@ -209,7 +209,7 @@ class LoopClosureDetector:
         )
         
         # If ICP verification passes
-        if inlier_ratio > 0.5:  # At least 50% inlier points
+        if inlier_ratio > 0.3:  # At least 50% inlier points
             # Calculate relative transformation between poses
             rel_pose = self._calculate_relative_pose(best_match['pose'], current_pose)
             

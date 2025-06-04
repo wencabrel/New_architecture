@@ -83,14 +83,14 @@ class OccupancyGrid:
         self.motion_compensation = True       # Whether to compensate for robot motion during scans
         self.scan_history_length = 80          # Number of previous scans to keep for motion analysis
         self.previous_poses = []              # Store previous robot poses to detect turns
-        self.turn_detection_threshold = 0.001   # Threshold for detecting turns (radians)
+        self.turn_detection_threshold = 0.005   # Threshold for detecting turns (radians)
         self.max_angle_of_incidence = 8      # Maximum angle (degrees) for reliable measurements
         self.outlier_rejection_threshold = 1  # Standard deviations for outlier rejection
         self.dynamic_object_threshold = 0.1   # Threshold for detecting potentially dynamic objects
         
         # For temporal filtering
         self.temporal_consistency_grid = np.zeros((self.grid_height, self.grid_width))
-        self.consistency_threshold = 3       # Number of consistent observations needed
+        self.consistency_threshold = 2       # Number of consistent observations needed
         
     def _expand_grid(self, direction):
         """
