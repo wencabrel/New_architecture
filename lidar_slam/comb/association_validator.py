@@ -9,7 +9,7 @@ from enum import Enum
 # Import existing components and association module
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from ScanMatcher import PoseEstimate
+    from pose_estimate import PoseEstimate
     from feature_association import FeatureDescriptor, AssociationScore, FeatureAssociationEngine
     DEPENDENCIES_AVAILABLE = True
 except ImportError:

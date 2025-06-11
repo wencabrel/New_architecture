@@ -9,7 +9,7 @@ import copy
 # Import existing components (assuming they're available)
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from ScanMatcher import PoseEstimate
+    from pose_estimate import PoseEstimate
     DEPENDENCIES_AVAILABLE = True
 except ImportError:
     print("Warning: Some dependencies not available. Feature association will have limited functionality.")

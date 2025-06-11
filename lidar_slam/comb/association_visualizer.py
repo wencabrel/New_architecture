@@ -12,7 +12,6 @@ import os
 # Import existing components
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from ScanMatcher import PoseEstimate
     from feature_association import FeatureDescriptor, AssociationScore, FeatureAssociationEngine
     from association_validator import ValidationResult, AssociationValidator
     from hybrid_pose_estimator import PoseEstimateWithConfidence, EnvironmentClassifier, HybridPoseEstimator

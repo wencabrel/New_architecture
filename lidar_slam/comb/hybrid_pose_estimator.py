@@ -8,7 +8,7 @@ from enum import Enum
 # Import existing components
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from ScanMatcher import PoseEstimate
+    from pose_estimate import PoseEstimate
     from feature_association import FeatureDescriptor, AssociationScore, FeatureAssociationEngine
     from association_validator import ValidationResult, AssociationValidator
     DEPENDENCIES_AVAILABLE = True
@@ -67,7 +67,7 @@ class EnvironmentClassifier:
         self.current_classification = "unknown"
         
     def classify_environment(self, feature_set: FeatureSet, 
-                           motion_estimate: Optional["PoseEstimate"] = None) -> Dict[str, float]:
+                           motion_estimate: Optional[PoseEstimate] = None) -> Dict[str, float]:
         """
         Classify the current environment based on feature characteristics
         
@@ -337,10 +337,10 @@ class HybridPoseEstimator:
     
     def estimate_hybrid_pose(self, feature_pose: Optional[PoseEstimateWithConfidence],
                            icp_pose: Optional[PoseEstimateWithConfidence],
-                           odometry_pose: Optional["PoseEstimate"],
+                           odometry_pose: Optional[PoseEstimate],
                            current_features: Optional[FeatureSet] = None,
                            validation_result: Optional[ValidationResult] = None,
-                           motion_estimate: Optional["PoseEstimate"] = None) -> PoseEstimateWithConfidence:
+                           motion_estimate: Optional[PoseEstimate] = None) -> PoseEstimateWithConfidence:
         """
         Estimate hybrid pose by intelligently combining available pose sources
         
@@ -386,7 +386,7 @@ class HybridPoseEstimator:
         # Case 1: Neither feature nor ICP pose available
         if not has_feature_pose and not has_icp_pose:
             if has_odometry_pose and self.fallback_to_odometry:
-                result.pose = "PoseEstimate"(odometry_pose.x, odometry_pose.y, odometry_pose.theta)
+                result.pose = PoseEstimate(odometry_pose.x, odometry_pose.y, odometry_pose.theta)
                 result.confidence = 0.3  # Low confidence for odometry-only
                 result.source = PoseSource.ODOMETRY
                 result.fallback_reason = "No feature or ICP poses available"
@@ -395,12 +395,12 @@ class HybridPoseEstimator:
                 # Return previous pose if available
                 if self.pose_history:
                     last_pose = self.pose_history[-1]
-                    result.pose = "PoseEstimate"(last_pose.x, last_pose.y, last_pose.theta)
+                    result.pose = PoseEstimate(last_pose.x, last_pose.y, last_pose.theta)
                     result.confidence = 0.2  # Very low confidence
                     result.source = PoseSource.RECOVERY
                     result.fallback_reason = "No poses available, using previous"
                 else:
-                    result.pose = "PoseEstimate"(0, 0, 0)
+                    result.pose = PoseEstimate(0, 0, 0)
                     result.confidence = 0.1
                     result.source = PoseSource.RECOVERY
                     result.fallback_reason = "No poses or history available"
@@ -478,7 +478,7 @@ class HybridPoseEstimator:
             Copy of the pose
         """
         result = PoseEstimateWithConfidence()
-        result.pose = "PoseEstimate"(source_pose.pose.x, source_pose.pose.y, source_pose.pose.theta)
+        result.pose = PoseEstimate(source_pose.pose.x, source_pose.pose.y, source_pose.pose.theta)
         result.confidence = source_pose.confidence
         result.geometric_confidence = source_pose.geometric_confidence
         result.temporal_confidence = source_pose.temporal_confidence
@@ -543,7 +543,7 @@ class HybridPoseEstimator:
         
         # Create result
         result = PoseEstimateWithConfidence()
-        result.pose = "PoseEstimate"(combined_x, combined_y, combined_angle)
+        result.pose = PoseEstimate(combined_x, combined_y, combined_angle)
         result.source = PoseSource.HYBRID
         
         # Combine confidence metrics
@@ -744,7 +744,7 @@ class HybridPoseEstimator:
 
 
 # Utility functions for integration
-def create_pose_with_confidence(pose: "PoseEstimate", confidence: float, 
+def create_pose_with_confidence(pose: PoseEstimate, confidence: float, 
                                source: PoseSource = PoseSource.ODOMETRY) -> PoseEstimateWithConfidence:
     """
     Convenience function to create a PoseEstimateWithConfidence
@@ -758,7 +758,7 @@ def create_pose_with_confidence(pose: "PoseEstimate", confidence: float,
         PoseEstimateWithConfidence object
     """
     result = PoseEstimateWithConfidence()
-    result.pose = "PoseEstimate"(pose.x, pose.y, pose.theta) if pose else None
+    result.pose = PoseEstimate(pose.x, pose.y, pose.theta) if pose else None
     result.confidence = confidence
     result.source = source
     return result

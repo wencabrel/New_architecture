@@ -8,6 +8,7 @@ import os
 import time
 from matplotlib.widgets import Button
 import sys
+from pose_estimate import PoseEstimate
 
 # Import our utility functions and classes
 from lidar_utility_functions import parse_lidar_data, convert_scans_to_cartesian, read_lidar_data_from_file
@@ -20,39 +21,27 @@ try:
 except ImportError:
     print("Warning: Feature extraction module not available. Feature extraction will be disabled.")
     FEATURE_EXTRACTION_AVAILABLE = False
-
-class PoseEstimate:
-    """Class to represent a robot pose estimate with uncertainty"""
     
-    def __init__(self, x=0.0, y=0.0, theta=0.0):
-        """Initialize a pose estimate"""
-        self.x = x
-        self.y = y
-        self.theta = theta
-        
-        # Covariance matrix for x, y, theta
-        self.covariance = np.eye(3) * 0.01  # Default small uncertainty
-        
-    def to_dict(self):
-        """Convert pose to dictionary format compatible with existing code"""
-        return {
-            'x': self.x,
-            'y': self.y,
-            'theta': self.theta
-        }
-    
-    def from_dict(self, pose_dict):
-        """Set pose from dictionary format"""
-        self.x = pose_dict['x']
-        self.y = pose_dict['y']
-        self.theta = pose_dict['theta']
-        return self
-    
-    def copy(self):
-        """Create a copy of this pose estimate"""
-        new_pose = PoseEstimate(self.x, self.y, self.theta)
-        new_pose.covariance = self.covariance.copy()
-        return new_pose
+# Import feature association components (with graceful fallback)
+try:
+    from feature_association import (
+        FeatureAssociationEngine, FeatureDescriptor, AssociationScore,
+        associate_consecutive_scans, create_descriptors_from_feature_set
+    )
+    from association_validator import (
+        AssociationValidator, ValidationResult, TemporalConsistencyChecker,
+        validate_feature_associations, get_robust_associations
+    )
+    from hybrid_pose_estimator import (
+        HybridPoseEstimator, PoseEstimateWithConfidence, EnvironmentClassifier,
+        PoseSource, estimate_pose_from_associations, create_pose_with_confidence
+    )
+    FEATURE_ASSOCIATION_AVAILABLE = True
+    print("[ScanMatcher] Feature association modules loaded successfully")
+except ImportError as e:
+    print(f"Warning: Feature association modules not available: {e}")
+    print("Feature association will be disabled.")
+    FEATURE_ASSOCIATION_AVAILABLE = False
 
 class ImprovedScanMatchingLocalization:
     """
@@ -60,14 +49,16 @@ class ImprovedScanMatchingLocalization:
     with adaptive parameters, alignment reset, aggressive resampling, and optional feature extraction.
     """
     
-    def __init__(self, occupancy_grid=None, debug_level=1, enable_feature_extraction=False):
+    def __init__(self, occupancy_grid=None, debug_level=1, 
+                enable_feature_extraction=False, enable_feature_association=False):
         """
-        Initialize the improved scan matching system with optional feature extraction
+        Initialize the improved scan matching system with optional feature extraction and association
         
         Args:
             occupancy_grid: OccupancyGrid object representing the map
             debug_level: 0=none, 1=basic info, 2=detailed, 3=verbose
             enable_feature_extraction: Whether to enable feature extraction alongside ICP
+            enable_feature_association: Whether to enable feature association and hybrid poses
         """
         self.map = occupancy_grid
         self.debug_level = debug_level
@@ -88,14 +79,14 @@ class ImprovedScanMatchingLocalization:
         if self.enable_feature_extraction:
             try:
                 self.feature_extractor = FeatureExtractor(
-                    debug_level=max(0, debug_level - 1),  # Slightly less verbose for features
-                    curvature_window_size=5,
-                    num_sectors=6,
-                    sharp_edge_threshold=0.1,
-                    planar_threshold=0.1,
-                    max_sharp_edges_per_sector=2,
-                    max_less_sharp_per_sector=20,
-                    max_planar_per_sector=4
+                    debug_level=max(0, debug_level - 1),
+                    curvature_window_size=5,           # Keep same for accuracy
+                    num_sectors=6,                     # Keep same for coverage
+                    sharp_edge_threshold=0.15,         # INCREASED: More selective for sharp edges
+                    planar_threshold=0.08,             # DECREASED: More selective for planes  
+                    max_sharp_edges_per_sector=1,      # REDUCED: 1 instead of 2
+                    max_less_sharp_per_sector=8,       # REDUCED: 8 instead of 20
+                    max_planar_per_sector=2  
                 )
                 if self.debug_level > 0:
                     print("[ScanMatcher] Feature extraction ENABLED")
@@ -108,6 +99,90 @@ class ImprovedScanMatchingLocalization:
         else:
             if self.debug_level > 0:
                 print("[ScanMatcher] Feature extraction DISABLED")
+                
+        # ============== NEW: FEATURE ASSOCIATION COMPONENTS ==============
+        self.enable_feature_association = (enable_feature_association and 
+                                        FEATURE_ASSOCIATION_AVAILABLE and 
+                                        self.enable_feature_extraction)  # Requires feature extraction
+        
+        # Association components
+        self.association_engine = None
+        self.association_validator = None
+        self.hybrid_estimator = None
+        
+        # Association statistics and monitoring
+        self.association_stats = {
+            'total_associations': 0,
+            'successful_associations': 0,
+            'total_validations': 0,
+            'successful_validations': 0,
+            'total_hybrid_poses': 0,
+            'feature_dominant_poses': 0,
+            'icp_dominant_poses': 0,
+            'balanced_poses': 0,
+            'fallback_poses': 0,
+            'average_association_time': 0.0,
+            'average_validation_time': 0.0,
+            'average_hybrid_time': 0.0,
+            'total_association_time': 0.0
+        }
+        
+        # Performance monitoring
+        self.association_time_budget = 15.0  # ms - conservative budget for association processing
+        self.association_time_warnings = 0
+        
+        # Pose history for temporal consistency (sliding window)
+        self.max_pose_history = 10  # Keep last 10 poses for temporal analysis
+        self.hybrid_pose_history = []
+        
+        # Initialize association components if enabled
+        if self.enable_feature_association:
+            try:
+                # Conservative parameters for initial deployment
+                self.association_engine = FeatureAssociationEngine(
+                    max_association_distance=1.5,  # Conservative: shorter association distance
+                    min_similarity_threshold=0.4,  # Conservative: higher similarity requirement
+                    enable_temporal_prediction=True,
+                    enable_adaptive_gating=True,
+                    debug_level=max(0, debug_level - 1)
+                )
+                
+                self.association_validator = AssociationValidator(
+                    ransac_threshold=0.3,  # Conservative: stricter geometric validation
+                    min_inliers=4,  # Conservative: require more inliers
+                    ransac_iterations=50,  # Conservative: more iterations for robustness
+                    debug_level=max(0, debug_level - 1)
+                )
+                
+                self.hybrid_estimator = HybridPoseEstimator(
+                    enable_adaptive_weighting=True,
+                    enable_environment_classification=True,
+                    fallback_to_odometry=True,
+                    debug_level=max(0, debug_level - 1)
+                )
+                
+                if self.debug_level > 0:
+                    print("[ScanMatcher] Feature association ENABLED")
+                    print(f"[ScanMatcher]   - Association distance: {self.association_engine.max_association_distance}m")
+                    print(f"[ScanMatcher]   - Similarity threshold: {self.association_engine.min_similarity_threshold}")
+                    print(f"[ScanMatcher]   - RANSAC threshold: {self.association_validator.ransac_threshold}m")
+                    print(f"[ScanMatcher]   - Time budget: {self.association_time_budget}ms per scan")
+                    print(f"[ScanMatcher]   - Target: Enhanced robustness in structured environments")
+                    
+            except Exception as e:
+                print(f"[ScanMatcher] Error initializing feature association: {e}")
+                self.enable_feature_association = False
+                self.association_engine = None
+                self.association_validator = None
+                self.hybrid_estimator = None
+        else:
+            if self.debug_level > 0:
+                if not enable_feature_association:
+                    print("[ScanMatcher] Feature association DISABLED by user")
+                elif not FEATURE_ASSOCIATION_AVAILABLE:
+                    print("[ScanMatcher] Feature association DISABLED - modules not available")
+                elif not self.enable_feature_extraction:
+                    print("[ScanMatcher] Feature association DISABLED - requires feature extraction")
         
         # Default ICP parameters (will be adjusted adaptively)
         self.max_iterations = 15
@@ -246,6 +321,29 @@ class ImprovedScanMatchingLocalization:
         # Initialize feature history if feature extraction is enabled
         if self.enable_feature_extraction:
             self.feature_history = []
+            # Initialize association components if enabled
+            if self.enable_feature_association:
+                # Reset association statistics for this processing session
+                self.association_stats = {
+                    'total_associations': 0,
+                    'successful_associations': 0,
+                    'total_validations': 0,
+                    'successful_validations': 0,
+                    'total_hybrid_poses': 0,
+                    'feature_dominant_poses': 0,
+                    'icp_dominant_poses': 0,
+                    'balanced_poses': 0,
+                    'fallback_poses': 0,
+                    'average_association_time': 0.0,
+                    'total_association_time': 0.0
+                }
+                
+                # Reset pose history for this session
+                self.hybrid_pose_history = []
+                
+                if self.debug_level > 0:
+                    print("[ScanMatcher] Feature association is ENABLED for this processing session")
+                    print(f"[ScanMatcher]   - Association components initialized and ready")
             # Add empty feature set for initial pose
             empty_feature_set = FeatureSet()
             empty_feature_set.robot_pose = initial_pose.copy()
@@ -495,7 +593,38 @@ class ImprovedScanMatchingLocalization:
                         # Reset the consecutive failures counter
                         self.consecutive_poor_matches = 0
                         
-                        # Print final matched pose
+                        # STEP 1: Create final_pose FIRST (before using it in debug output)
+                        if self.enable_feature_association and feature_set is not None:
+                            # Process feature association to get hybrid pose
+                            hybrid_pose = self._process_feature_association(
+                                feature_set, matched_pose, i, scan_data
+                            )
+                            
+                            # Use hybrid pose as final pose
+                            final_pose = PoseEstimate(
+                                hybrid_pose.pose.x,
+                                hybrid_pose.pose.y, 
+                                hybrid_pose.pose.theta
+                            )
+                            
+                            # Store hybrid pose information for debugging
+                            final_pose.confidence = hybrid_pose.confidence
+                            final_pose.source = hybrid_pose.source
+                            
+                        else:
+                            # Use ICP pose directly (existing behavior)
+                            final_pose = matched_pose.copy()
+                        
+                        # STEP 2: Now create debug output (final_pose is available)
+                        feature_info = self._get_feature_info_string(feature_set) if feature_set else None
+                        
+                        # Add association info to the debug output
+                        enhanced_stage = "AFTER MATCHING (VALID)"
+                        if self.enable_feature_association and hasattr(final_pose, 'source'):
+                            association_info = self._get_association_info_string_for_pose(final_pose)
+                            enhanced_stage += f" | {association_info}"
+                        
+                        # STEP 3: Print pose comparison with all information available
                         self.print_pose_comparison(
                             match_num=self.match_count+1,
                             previous_pose=self.last_matched_pose,
@@ -503,13 +632,13 @@ class ImprovedScanMatchingLocalization:
                             initial_guess=initial_guess,
                             estimated_pose=matched_pose,
                             match_info=match_info,
-                            stage="AFTER MATCHING (VALID)",
-                            feature_info=self._get_feature_info_string(feature_set) if feature_set else None
+                            stage=enhanced_stage,
+                            feature_info=feature_info
                         )
                         
-                        # Update trajectory with the matched pose
-                        self.trajectory.append(matched_pose.copy())
-                        self.last_matched_pose = matched_pose
+                        # STEP 4: Update trajectory with final pose
+                        self.trajectory.append(final_pose)
+                        self.last_matched_pose = final_pose
                         
                         if self.debug_level > 1:
                             print(f"\n[ScanMatcher] Valid match found. Score: {match_info['final_score']:.4f}")
@@ -520,21 +649,62 @@ class ImprovedScanMatchingLocalization:
                         # If match is invalid, use the odometry pose with small correction
                         corrected_pose = self.applySmallCorrection(odometry_pose, self.last_matched_pose)
                         
-                        # Print corrected pose 
+                        # STEP 1: Create final_pose FIRST
+                        if self.enable_feature_association and feature_set is not None:
+                            try:
+                                # Process feature association as potential fallback
+                                hybrid_pose = self._process_feature_association(
+                                    feature_set, corrected_pose, i, scan_data
+                                )
+                                
+                                # Use hybrid pose if it has good confidence, otherwise use corrected pose
+                                if hybrid_pose.confidence > 0.6:
+                                    final_pose = PoseEstimate(
+                                        hybrid_pose.pose.x,
+                                        hybrid_pose.pose.y, 
+                                        hybrid_pose.pose.theta
+                                    )
+                                    final_pose.confidence = hybrid_pose.confidence
+                                    final_pose.source = hybrid_pose.source
+                                    
+                                    if self.debug_level > 1:
+                                        print(f"\n[ScanMatcher] Using feature-based pose as ICP fallback "
+                                              f"(confidence: {hybrid_pose.confidence:.3f})")
+                                else:
+                                    final_pose = corrected_pose.copy()
+                                    
+                            except Exception as e:
+                                if self.debug_level > 1:
+                                    print(f"\n[ScanMatcher] Feature fallback failed: {e}")
+                                final_pose = corrected_pose.copy()
+                        else:
+                            final_pose = corrected_pose.copy()
+                        
+                        # STEP 2: Now create debug output (final_pose is available)
+                        feature_info = self._get_feature_info_string(feature_set) if feature_set else None
+                        
+                        # Add association info to the debug output if available
+                        enhanced_stage = "AFTER MATCHING (INVALID - USING CORRECTION)"
+                        if self.enable_feature_association and hasattr(final_pose, 'source'):
+                            association_info = self._get_association_info_string_for_pose(final_pose)
+                            enhanced_stage += f" | {association_info}"
+                        
+                        # STEP 3: Print corrected pose 
                         self.print_pose_comparison(
                             match_num=self.match_count+1,
                             previous_pose=self.last_matched_pose,
                             odometry_pose=odometry_pose,
                             initial_guess=initial_guess,
                             estimated_pose=matched_pose,
-                            corrected_pose=corrected_pose,
+                            corrected_pose=final_pose,
                             match_info=match_info,
-                            stage="AFTER MATCHING (INVALID - USING CORRECTION)",
-                            feature_info=self._get_feature_info_string(feature_set) if feature_set else None
+                            stage=enhanced_stage,
+                            feature_info=feature_info
                         )
                         
-                        self.trajectory.append(corrected_pose.copy())
-                        self.last_matched_pose = corrected_pose
+                        # STEP 4: Update trajectory with final pose
+                        self.trajectory.append(final_pose)
+                        self.last_matched_pose = final_pose
                         
                         # Check if we need to enter recovery mode
                         if self.consecutive_poor_matches >= 3:
@@ -568,8 +738,273 @@ class ImprovedScanMatchingLocalization:
             # Print feature extraction statistics if enabled
             if self.enable_feature_extraction:
                 self.print_feature_extraction_summary()
+            
+            # Print feature association statistics if enabled
+            if self.enable_feature_association:
+                self.print_feature_association_summary()
                 
         return self.trajectory
+
+    def _process_feature_association(self, current_features, icp_pose, scan_index, scan_data):
+        """
+        Process feature association and return hybrid pose estimate
+        
+        Args:
+            current_features: Current scan's FeatureSet
+            icp_pose: ICP-derived pose estimate
+            scan_index: Index of current scan
+            scan_data: Raw scan data dictionary
+            
+        Returns:
+            PoseEstimateWithConfidence: Hybrid pose or fallback pose
+        """
+        import time
+        
+        if not self.enable_feature_association or scan_index == 0:
+            # Convert ICP pose to PoseEstimateWithConfidence for consistency
+            return create_pose_with_confidence(icp_pose, 0.7, PoseSource.ICP_BASED)
+        
+        association_start_time = time.time() * 1000  # milliseconds
+        
+        try:
+            # Get previous features
+            previous_features = self.feature_history[-1] if self.feature_history else None
+            
+            if not previous_features or len(previous_features.features) < 3:
+                if self.debug_level > 1:
+                    print(f"[ScanMatcher] Insufficient previous features for association")
+                return create_pose_with_confidence(icp_pose, 0.7, PoseSource.ICP_BASED)
+            
+            if self.debug_level > 2:
+                print(f"\n[ScanMatcher] --- Feature Association for Scan {scan_index} ---")
+                print(f"[ScanMatcher] Current features: {len(current_features.features)}")
+                print(f"[ScanMatcher] Previous features: {len(previous_features.features)}")
+            
+            # Step 1: Feature Association
+            association_time_start = time.time() * 1000
+            
+            # Estimate motion for association guidance
+            motion_estimate = self._estimate_motion_from_poses() if len(self.trajectory) > 1 else None
+            
+            associations, estimated_motion = associate_consecutive_scans(
+                current_features, 
+                previous_features, 
+                motion_estimate=motion_estimate,
+                engine=self.association_engine
+            )
+            
+
+
+            association_time = time.time() * 1000 - association_time_start
+            
+            # Update the stored association with actual processing time
+            if hasattr(self, 'stored_associations') and self.stored_associations:
+                self.stored_associations[-1]['processing_time'] = total_association_time
+            
+            if self.debug_level > 2:
+                print(f"[ScanMatcher] Found {len(associations)} associations in {association_time:.2f}ms")
+            
+            # Update association statistics
+            self.association_stats['total_associations'] += len(associations)
+            if associations:
+                self.association_stats['successful_associations'] += 1
+            
+            # Step 2: Validation
+            validation_time_start = time.time() * 1000
+            
+            validation_result = validate_feature_associations(
+                associations, current_features, previous_features, self.association_validator
+            )
+            
+            validation_time = time.time() * 1000 - validation_time_start
+            
+            # Update validation statistics
+            self.association_stats['total_validations'] += 1
+            if validation_result.is_valid:
+                self.association_stats['successful_validations'] += 1
+            
+            if self.debug_level > 2:
+                print(f"[ScanMatcher] Validation: {'PASSED' if validation_result.is_valid else 'FAILED'} "
+                    f"(confidence: {validation_result.confidence:.3f}) in {validation_time:.2f}ms")
+            
+            # Step 3: Feature-based pose estimation
+            feature_pose = None
+            if validation_result.is_valid and len(associations) >= 3:
+                try:
+                    # Create descriptors for pose estimation
+                    current_descriptors = create_descriptors_from_feature_set(current_features, scan_index)
+                    previous_descriptors = create_descriptors_from_feature_set(previous_features, scan_index-1)
+                    
+                    feature_pose = estimate_pose_from_associations(
+                        associations, current_descriptors, previous_descriptors, validation_result
+                    )
+                    
+                    if self.debug_level > 2:
+                        print(f"[ScanMatcher] Feature pose: x={feature_pose.pose.x:.3f}, "
+                            f"y={feature_pose.pose.y:.3f}, θ={feature_pose.pose.theta:.3f}, "
+                            f"conf={feature_pose.confidence:.3f}")
+                        
+                except Exception as e:
+                    if self.debug_level > 0:
+                        print(f"[ScanMatcher] Feature pose estimation failed: {e}")
+            
+            # Step 4: Hybrid pose estimation
+            hybrid_time_start = time.time() * 1000
+            
+            # Convert ICP pose to PoseEstimateWithConfidence
+            icp_pose_with_conf = create_pose_with_confidence(icp_pose, 0.8, PoseSource.ICP_BASED)
+            
+            # Estimate motion for environment classification
+            motion_estimate = self._estimate_motion_from_poses() if len(self.trajectory) > 1 else None
+            
+            hybrid_pose = self.hybrid_estimator.estimate_hybrid_pose(
+                feature_pose=feature_pose,
+                icp_pose=icp_pose_with_conf,
+                odometry_pose=self._get_odometry_pose(scan_data),
+                current_features=current_features,
+                validation_result=validation_result,
+                motion_estimate=motion_estimate
+            )
+            
+            hybrid_time = time.time() * 1000 - hybrid_time_start
+            
+            # Update hybrid pose statistics
+            self.association_stats['total_hybrid_poses'] += 1
+            if hasattr(hybrid_pose, 'feature_weight'):
+                if hybrid_pose.feature_weight > 0.6:
+                    self.association_stats['feature_dominant_poses'] += 1
+                elif hybrid_pose.feature_weight < 0.4:
+                    self.association_stats['icp_dominant_poses'] += 1
+                else:
+                    self.association_stats['balanced_poses'] += 1
+            
+            if hybrid_pose.source == PoseSource.ODOMETRY:
+                self.association_stats['fallback_poses'] += 1
+            
+            # TEMPORARY DEBUG: Add this right after hybrid pose estimation
+            print(f"DEBUG - Raw confidences: Feature={feature_pose.confidence if feature_pose else 'None'}, ICP={icp_pose_with_conf.confidence}")
+            print(f"DEBUG - Feature weight in hybrid: {getattr(hybrid_pose, 'feature_weight', 'Not available')}")
+
+            # Log classification reasoning
+            if hasattr(hybrid_pose, 'feature_weight'):
+                fw = hybrid_pose.feature_weight
+                if fw > 0.6:
+                    classification = "FEATURE_DOMINANT"
+                elif fw < 0.4:
+                    classification = "ICP_DOMINANT" 
+                else:
+                    classification = "BALANCED"
+                print(f"DEBUG - Classification: {classification} (fw={fw:.3f}, thresholds: >0.6 feature, <0.4 ICP)")            
+            
+            # Total processing time
+            total_association_time = time.time() * 1000 - association_start_time
+            
+            # Update timing statistics
+            self.association_stats['total_association_time'] += total_association_time
+            self.association_stats['average_association_time'] = (
+                self.association_stats['total_association_time'] / 
+                self.association_stats['total_hybrid_poses']
+            )
+            
+            # Performance monitoring
+            if total_association_time > self.association_time_budget:
+                self.association_time_warnings += 1
+                if self.debug_level > 0:
+                    print(f"[ScanMatcher] ⚠️ Association processing time exceeded budget: "
+                        f"{total_association_time:.2f}ms > {self.association_time_budget}ms "
+                        f"(warning #{self.association_time_warnings})")
+            
+            if self.debug_level > 1:
+                print(f"[ScanMatcher] Hybrid pose: x={hybrid_pose.pose.x:.3f}, "
+                    f"y={hybrid_pose.pose.y:.3f}, θ={hybrid_pose.pose.theta:.3f}, "
+                    f"conf={hybrid_pose.confidence:.3f}, source={hybrid_pose.source.value}")
+                print(f"[ScanMatcher] Total association time: {total_association_time:.2f}ms")
+            
+            # Store in pose history for temporal analysis
+            self.hybrid_pose_history.append(hybrid_pose)
+            if len(self.hybrid_pose_history) > self.max_pose_history:
+                self.hybrid_pose_history.pop(0)
+            
+            return hybrid_pose
+            
+        except Exception as e:
+            if self.debug_level > 0:
+                print(f"[ScanMatcher] Feature association failed: {e}")
+            
+            # Return ICP pose as fallback
+            self.association_stats['fallback_poses'] += 1
+            return create_pose_with_confidence(icp_pose, 0.6, PoseSource.ICP_BASED)
+        
+    def _estimate_motion_from_poses(self):
+        """Estimate motion between last two poses for association guidance"""
+        if len(self.trajectory) < 2:
+            return None
+        
+        current = self.trajectory[-1]
+        previous = self.trajectory[-2]
+        
+        dx = current.x - previous.x
+        dy = current.y - previous.y
+        dtheta = current.theta - previous.theta
+        
+        # Normalize angle difference
+        import math
+        while dtheta > math.pi:
+            dtheta -= 2 * math.pi
+        while dtheta < -math.pi:
+            dtheta += 2 * math.pi
+        
+        return PoseEstimate(dx, dy, dtheta)
+
+    def _get_odometry_pose(self, scan_data):
+        """Extract odometry pose from scan data"""
+        pose_dict = scan_data.get('pose', {})
+        return PoseEstimate(
+            pose_dict.get('x', 0.0),
+            pose_dict.get('y', 0.0), 
+            pose_dict.get('theta', 0.0)
+        )
+
+    def _get_association_info_string(self, hybrid_pose):
+        """Generate compact string with association information for debug output"""
+        if not self.enable_feature_association or not hybrid_pose:
+            return "No associations"
+        
+        source = hybrid_pose.source.value.replace('_', ' ').title()
+        conf = hybrid_pose.confidence
+        
+        info = f"Source: {source}, Conf: {conf:.3f}"
+        
+        if hasattr(hybrid_pose, 'feature_weight'):
+            fw = hybrid_pose.feature_weight
+            iw = getattr(hybrid_pose, 'icp_weight', 1.0 - fw)
+            info += f", Weights: F:{fw:.2f}/I:{iw:.2f}"
+        
+        if hasattr(hybrid_pose, 'num_features_used'):
+            info += f", Features: {hybrid_pose.num_features_used}"
+        
+        if hasattr(hybrid_pose, 'validation_passed'):
+            info += f", Valid: {'Yes' if hybrid_pose.validation_passed else 'No'}"
+        
+        return info
+
+    def _get_association_info_string_for_pose(self, pose):
+        """Generate compact string with association information from a pose object"""
+        if not self.enable_feature_association or not hasattr(pose, 'source'):
+            return "No association info"
+        
+        source = pose.source.value.replace('_', ' ').title() if hasattr(pose.source, 'value') else str(pose.source)
+        conf = getattr(pose, 'confidence', 0.0)
+        
+        info = f"Source: {source}, Conf: {conf:.3f}"
+        
+        if hasattr(pose, 'feature_weight'):
+            fw = pose.feature_weight
+            iw = getattr(pose, 'icp_weight', 1.0 - fw)
+            info += f", Weights: F:{fw:.2f}/I:{iw:.2f}"
+        
+        return info
+
     
     def _get_feature_info_string(self, feature_set):
         """
@@ -636,6 +1071,95 @@ class ImprovedScanMatchingLocalization:
             print(f"Quality status: {quality_status}")
         
         print(f"{'='*80}")
+        
+    def print_feature_association_summary(self):
+        """Print comprehensive summary of feature association performance"""
+        if not self.enable_feature_association:
+            return
+        
+        stats = self.association_stats
+        
+        print(f"\n{'='*80}")
+        print(f"FEATURE ASSOCIATION PERFORMANCE SUMMARY")
+        print(f"{'='*80}")
+        
+        print(f"Association Statistics:")
+        print(f"  Total associations found: {stats['total_associations']}")
+        print(f"  Successful association attempts: {stats['successful_associations']}")
+        print(f"  Association success rate: {stats['successful_associations']/(stats['total_hybrid_poses'] or 1)*100:.1f}%")
+        
+        print(f"\nValidation Statistics:")
+        print(f"  Total validations: {stats['total_validations']}")
+        print(f"  Successful validations: {stats['successful_validations']}")
+        print(f"  Validation success rate: {stats['successful_validations']/(stats['total_validations'] or 1)*100:.1f}%")
+        
+        print(f"\nHybrid Pose Statistics:")
+        print(f"  Total hybrid poses: {stats['total_hybrid_poses']}")
+        print(f"  Feature-dominant poses: {stats['feature_dominant_poses']} ({stats['feature_dominant_poses']/(stats['total_hybrid_poses'] or 1)*100:.1f}%)")
+        print(f"  ICP-dominant poses: {stats['icp_dominant_poses']} ({stats['icp_dominant_poses']/(stats['total_hybrid_poses'] or 1)*100:.1f}%)")
+        print(f"  Balanced poses: {stats['balanced_poses']} ({stats['balanced_poses']/(stats['total_hybrid_poses'] or 1)*100:.1f}%)")
+        print(f"  Fallback poses: {stats['fallback_poses']} ({stats['fallback_poses']/(stats['total_hybrid_poses'] or 1)*100:.1f}%)")
+        
+        print(f"\nPerformance Statistics:")
+        print(f"  Average association time: {stats['average_association_time']:.2f} ms")
+        print(f"  Time budget: {self.association_time_budget} ms")
+        print(f"  Budget violations: {self.association_time_warnings}")
+        
+        # Performance assessment
+        if stats['average_association_time'] <= self.association_time_budget:
+            performance_status = "EXCELLENT"
+        elif stats['average_association_time'] <= self.association_time_budget * 1.5:
+            performance_status = "GOOD"
+        elif stats['average_association_time'] <= self.association_time_budget * 2.0:
+            performance_status = "ACCEPTABLE"
+        else:
+            performance_status = "NEEDS OPTIMIZATION"
+        
+        print(f"  Performance status: {performance_status}")
+        
+        validation_rate = stats['successful_validations'] / (stats['total_validations'] or 1)
+        if validation_rate >= 0.8:
+            validation_status = "EXCELLENT"
+        elif validation_rate >= 0.6:
+            validation_status = "GOOD"
+        elif validation_rate >= 0.4:
+            validation_status = "ACCEPTABLE"
+        else:
+            validation_status = "NEEDS IMPROVEMENT"
+        
+        print(f"  Validation status: {validation_status}")
+        print(f"{'='*80}")
+
+    def get_association_statistics(self):
+        """Get comprehensive association statistics dictionary"""
+        if not self.enable_feature_association:
+            return {'feature_association_enabled': False}
+        
+        stats = self.association_stats.copy()
+        stats['feature_association_enabled'] = True
+        
+        # Calculate derived metrics
+        total_poses = stats['total_hybrid_poses'] or 1
+        total_validations = stats['total_validations'] or 1
+        
+        stats['association_success_rate'] = stats['successful_associations'] / total_poses
+        stats['validation_success_rate'] = stats['successful_validations'] / total_validations
+        stats['feature_dominant_rate'] = stats['feature_dominant_poses'] / total_poses
+        stats['icp_dominant_rate'] = stats['icp_dominant_poses'] / total_poses
+        stats['balanced_rate'] = stats['balanced_poses'] / total_poses
+        stats['fallback_rate'] = stats['fallback_poses'] / total_poses
+        
+        # Performance flags
+        stats['performance_excellent'] = stats['average_association_time'] <= self.association_time_budget
+        stats['performance_good'] = stats['average_association_time'] <= self.association_time_budget * 1.5
+        stats['validation_excellent'] = stats['validation_success_rate'] >= 0.8
+        stats['validation_good'] = stats['validation_success_rate'] >= 0.6
+        
+        # Time budget monitoring
+        stats['time_budget'] = self.association_time_budget
+        stats['budget_violations'] = self.association_time_warnings
+        
+        return stats
     
     def adaptParametersBasedOnMatchQuality(self, match_info=None):
         """
@@ -1532,6 +2056,83 @@ class ImprovedScanMatchingLocalization:
         
         return ax
     
+    def visualize_associations_with_trajectory(self, ax=None, show_recent_only=True, recent_count=5):
+        """
+        Visualize feature associations overlaid on the robot trajectory
+        
+        Args:
+            ax: Matplotlib axis to plot on (None to create new)
+            show_recent_only: Whether to show only recent associations
+            recent_count: Number of recent scans to show associations for
+            
+        Returns:
+            Matplotlib axis with the plot
+        """
+        if not self.enable_feature_association or not self.feature_history:
+            print("No association data available for visualization.")
+            return None
+        
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot trajectory
+        trajectory_x = [pose.x for pose in self.trajectory]
+        trajectory_y = [pose.y for pose in self.trajectory]
+        
+        ax.plot(trajectory_x, trajectory_y, 'b-', linewidth=2, alpha=0.7, label='Robot Trajectory')
+        
+        # Plot recent associations
+        start_idx = max(0, len(self.feature_history) - recent_count) if show_recent_only else 0
+        
+        association_count = 0
+        for i in range(start_idx, len(self.feature_history) - 1):
+            try:
+                current_features = self.feature_history[i + 1]
+                previous_features = self.feature_history[i]
+                
+                # Get associations for this pair
+                associations, _ = associate_consecutive_scans(
+                    current_features, previous_features, engine=self.association_engine
+                )
+                
+                # Plot associations as lines between features
+                for assoc in associations[:10]:  # Limit to first 10 for clarity
+                    curr_feat = current_features.features[assoc.feature_idx1]
+                    prev_feat = previous_features.features[assoc.feature_idx2]
+                    
+                    # Convert to world coordinates
+                    curr_world = curr_feat.get_world_position()
+                    prev_world = prev_feat.get_world_position()
+                    
+                    # Color by association score
+                    color = plt.cm.viridis(assoc.score)
+                    ax.plot([prev_world[0], curr_world[0]], 
+                        [prev_world[1], curr_world[1]], 
+                        color=color, alpha=0.6, linewidth=1)
+                    
+                    association_count += 1
+                    
+            except Exception as e:
+                if self.debug_level > 1:
+                    print(f"Error visualizing associations for scan pair {i}: {e}")
+                continue
+        
+        # Mark start and end positions
+        if trajectory_x:
+            ax.scatter(trajectory_x[0], trajectory_y[0], 
+                    c='green', s=150, marker='*', edgecolors='black', linewidth=2, label='Start')
+            ax.scatter(trajectory_x[-1], trajectory_y[-1], 
+                    c='red', s=150, marker='*', edgecolors='black', linewidth=2, label='End')
+        
+        ax.set_title(f'Feature Associations Visualization\n({association_count} associations shown)')
+        ax.set_xlabel('X (meters)')
+        ax.set_ylabel('Y (meters)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_aspect('equal')
+        
+        return ax
+    
     def plotMatchOverlay(self, scan_x, scan_y, pose, ax=None, show_iterations=False):
         """
         Plot the scan overlaid on the map to visualize the match quality
@@ -1884,8 +2485,7 @@ class ImprovedScanMatchingLocalization:
         
         # Close the figure to free memory
         plt.close(fig)
-
-
+        
 def animate_lidar_data(parsed_data_list, flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False, 
                       show_occupancy_grid=True, grid_resolution=0.05, save_grid=False,
                       save_format='png', save_path='maps/', enable_scan_matching=False):
