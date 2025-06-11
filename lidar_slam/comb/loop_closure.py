@@ -981,6 +981,11 @@ def visualize_loop_closure_results(scan_matcher_obj, occupancy_grid):
         print("Loop closure is not enabled on this scan matcher object.")
         return
     
+    # Only plot if we have loop closures detected
+    if not scan_matcher_obj.loop_detector.detected_loops:
+        print("No loop closures detected to visualize.")
+        return
+    
     # Create a figure with multiple subplots
     fig = plt.figure(figsize=(18, 10))
     
