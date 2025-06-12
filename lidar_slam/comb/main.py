@@ -15,13 +15,35 @@ from occupancy_grid_class import OccupancyGrid
 from ScanMatcher import ImprovedScanMatchingLocalization, PoseEstimate
 from loop_closure import integrate_with_scan_matcher, process_loop_closure, visualize_loop_closure_results
 
+# Import feature association components for UI and statistics (with graceful fallback)
+try:
+    from feature_association import (
+        FeatureAssociationEngine, associate_consecutive_scans
+    )
+    from association_validator import (
+        AssociationValidator, validate_feature_associations
+    )
+    from hybrid_pose_estimator import (
+        HybridPoseEstimator, PoseSource
+    )
+    from association_visualizer import (
+        AssociationVisualizer, create_debug_visualizer, quick_association_plot
+    )
+    ASSOCIATION_UI_AVAILABLE = True
+except ImportError:
+    print("Note: Feature association UI components not available. Association controls will be disabled.")
+    ASSOCIATION_UI_AVAILABLE = False
+
+# Modifications to main.py for feature extraction integration
+
 def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_grid=True, 
                              grid_resolution=0.05, save_grid=True, save_format='all',
                              enable_scan_matching=True, enable_loop_closure=True,
+                             enable_feature_extraction=False, enable_feature_association=False, 
                              rebuild_map=True):
     """
     Main function to visualize LiDAR data in real-time with occupancy grid mapping, 
-    scan matching, and loop closure detection
+    scan matching, loop closure detection, feature extraction, and feature association
     
     Args:
         file_path: Path to the LiDAR data file
@@ -32,8 +54,11 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         save_format: Format to save the grid ('png', 'npy', 'csv', or 'all')
         enable_scan_matching: Whether to use scan matching localization algorithm
         enable_loop_closure: Whether to enable loop closure detection
+        enable_feature_extraction: Whether to enable feature extraction alongside ICP
+        enable_feature_association: Whether to enable feature association and hybrid poses
         rebuild_map: Whether to rebuild the map after loop closure optimization
     """
+    
     print(f"Reading LiDAR data from: {file_path}")
     
     # Check if file exists
@@ -64,6 +89,8 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             print(f"  Scan matching is ENABLED - using ICP with adaptive parameters")
         if enable_loop_closure and enable_scan_matching:
             print(f"  Loop closure detection is ENABLED - using Scan Context descriptors and pose graph optimization")
+        if enable_feature_extraction and enable_scan_matching:
+            print(f"  Feature extraction is ENABLED - using LOAM-style curvature-based features")
         if save_grid:
             print(f"  The final occupancy grid will be saved in '{save_format}' format")
     else:
@@ -124,7 +151,24 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     # Initialize scan matching localization if enabled
     if enable_scan_matching:
         print(f"  Using improved ICP scan matching algorithm with motion validation")
-        localizer = ImprovedScanMatchingLocalization(occupancy_grid, debug_level=1)
+        
+        # Enhanced initialization message
+        enhancement_features = []
+        if enable_feature_extraction:
+            enhancement_features.append("feature extraction")
+        if enable_feature_association:
+            enhancement_features.append("feature association")
+        
+        if enhancement_features:
+            print(f"  Enhanced with: {', '.join(enhancement_features)}")
+        
+        # Initialize scan matcher with all enabled features
+        localizer = ImprovedScanMatchingLocalization(
+            occupancy_grid, 
+            debug_level=1,
+            enable_feature_extraction=enable_feature_extraction,
+            enable_feature_association=enable_feature_association
+        )
         
         # Enable loop closure if requested
         if enable_loop_closure:
@@ -184,6 +228,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             robot_path_y.append(y)
         odometry_path_x = robot_path_x
         odometry_path_y = robot_path_y
+        localizer = None  # No localizer available
     
     # Create a figure with two subplots side by side if showing occupancy grid
     if show_occupancy_grid:
@@ -221,28 +266,281 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         plt.subplots_adjust(bottom=0.15)  # Make room for buttons
         
         # Button positions
-        button_width = 0.15
-        button_spacing = 0.02
+        button_width = 0.07
+        button_spacing = 0.01
         button_height = 0.04
         button_y = 0.05
+        button_x_start = 0.05
         
         # Add a Save Map button
-        save_button_ax = plt.axes([0.1, button_y, button_width, button_height])
+        save_button_ax = plt.axes([button_x_start, button_y, button_width, button_height])
         save_button = Button(save_button_ax, 'Save Map', color='lightblue', hovercolor='0.8')
+        
+        # Add feature extraction related buttons if enabled
+        if enable_feature_extraction and enable_scan_matching and localizer:
+            # Feature Visualization button
+            feature_viz_button_ax = plt.axes([button_x_start + (button_width + button_spacing), button_y, button_width, button_height])
+            feature_viz_button = Button(feature_viz_button_ax, 'Show Features', color='lightgreen', hovercolor='0.8')
+            
+            # Feature Statistics button
+            feature_stats_button_ax = plt.axes([button_x_start + 2*(button_width + button_spacing), button_y, button_width, button_height])
+            feature_stats_button = Button(feature_stats_button_ax, 'Feature Stats', color='lightyellow', hovercolor='0.8')
+            
+            # Save Features button  
+            save_features_button_ax = plt.axes([button_x_start + 3*(button_width + button_spacing), button_y, button_width, button_height])
+            save_features_button = Button(save_features_button_ax, 'Save Features', color='lightcoral', hovercolor='0.8')
+            
+            # Feature Association Controls (if enabled)
+            if enable_feature_association and ASSOCIATION_UI_AVAILABLE:
+                print("Setting up feature association visualization controls...")
+                
+                # Calculate button positions following the existing pattern
+                base_offset = 4  # Start after the 4 feature extraction buttons
+                
+                # Association Visualization button
+                assoc_viz_button_ax = plt.axes([
+                    button_x_start + base_offset*(button_width + button_spacing), 
+                    button_y, 
+                    button_width, 
+                    button_height
+                ])
+                assoc_viz_button = Button(assoc_viz_button_ax, 'Associations', color='lightpink', hovercolor='0.8')
+                
+                # Association Statistics button
+                assoc_stats_button_ax = plt.axes([
+                    button_x_start + (base_offset + 1)*(button_width + button_spacing), 
+                    button_y, 
+                    button_width, 
+                    button_height
+                ])
+                assoc_stats_button = Button(assoc_stats_button_ax, 'Assoc Stats', color='lightsteelblue', hovercolor='0.8')
+                
+                # Save Associations button
+                assoc_save_button_ax = plt.axes([
+                    button_x_start + (base_offset + 2)*(button_width + button_spacing), 
+                    button_y, 
+                    button_width, 
+                    button_height
+                ])
+                assoc_save_button = Button(assoc_save_button_ax, 'Save Assoc', color='lightgoldenrodyellow', hovercolor='0.8')
+                
+                # Hybrid Analysis button
+                hybrid_analysis_button_ax = plt.axes([
+                    button_x_start + (base_offset + 3)*(button_width + button_spacing), 
+                    button_y, 
+                    button_width, 
+                    button_height
+                ])
+                hybrid_analysis_button = Button(hybrid_analysis_button_ax, 'Hybrid Perf', color='lightcyan', hovercolor='0.8')
+                
+                def show_associations(event):
+                    try:
+                        if hasattr(localizer, 'enable_feature_association') and localizer.enable_feature_association:
+                            # Create association visualization
+                            fig_assoc = plt.figure(figsize=(15, 10))
+                            fig_assoc.suptitle('Feature Association Visualization', fontsize=16)
+                            
+                            # Create association visualizer
+                            if hasattr(localizer, 'visualize_associations_with_trajectory'):
+                                ax = localizer.visualize_associations_with_trajectory()
+                                if ax:
+                                    plt.show()
+                                    print("Association visualization displayed.")
+                                else:
+                                    print("No association data available for visualization.")
+                            else:
+                                print("Association visualization method not available.")
+                        else:
+                            print("Feature association is not enabled or not available.")
+                    except Exception as e:
+                        print(f"Error creating association visualization: {e}")
+                
+                def show_association_stats(event):
+                    try:
+                        if hasattr(localizer, 'get_association_statistics'):
+                            stats = localizer.get_association_statistics()
+                            
+                            print(f"\n{'='*60}")
+                            print(f"FEATURE ASSOCIATION STATISTICS")
+                            print(f"{'='*60}")
+                            
+                            if stats.get('feature_association_enabled', False):
+                                print(f"Association Success Rate: {stats.get('association_success_rate', 0)*100:.1f}%")
+                                print(f"Validation Success Rate: {stats.get('validation_success_rate', 0)*100:.1f}%")
+                                print(f"Average Association Time: {stats.get('average_association_time', 0):.2f}ms")
+                                print(f"Total Hybrid Poses: {stats.get('total_hybrid_poses', 0)}")
+                                print(f"Feature Dominant: {stats.get('feature_dominant_rate', 0)*100:.1f}%")
+                                print(f"ICP Dominant: {stats.get('icp_dominant_rate', 0)*100:.1f}%")
+                                print(f"Balanced: {stats.get('balanced_rate', 0)*100:.1f}%")
+                                print(f"Fallback Rate: {stats.get('fallback_rate', 0)*100:.1f}%")
+                                print(f"Budget Violations: {stats.get('budget_violations', 0)}")
+                                
+                                # Performance assessment
+                                if stats.get('performance_excellent', False):
+                                    print("Performance Status: ✅ EXCELLENT")
+                                elif stats.get('performance_good', False):
+                                    print("Performance Status: ✅ GOOD")
+                                else:
+                                    print("Performance Status: ⚠️ NEEDS OPTIMIZATION")
+                                    
+                                if stats.get('validation_excellent', False):
+                                    print("Validation Status: ✅ EXCELLENT")
+                                elif stats.get('validation_good', False):
+                                    print("Validation Status: ✅ GOOD")
+                                else:
+                                    print("Validation Status: ⚠️ NEEDS IMPROVEMENT")
+                            else:
+                                print("Feature association is not enabled.")
+                            
+                            print(f"{'='*60}")
+                            
+                        else:
+                            print("Association statistics not available.")
+                    except Exception as e:
+                        print(f"Error retrieving association statistics: {e}")
+                
+                def save_associations(event):
+                    try:
+                        if hasattr(localizer, 'enable_feature_association') and localizer.enable_feature_association:
+                            # Create association output directory
+                            maps_dir = "maps"
+                            if not os.path.exists(maps_dir):
+                                os.makedirs(maps_dir)
+                            
+                            assoc_dir = os.path.join(maps_dir, "associations")
+                            if not os.path.exists(assoc_dir):
+                                os.makedirs(assoc_dir)
+                            
+                            # Generate timestamp-based filename
+                            timestamp = time.strftime("%Y%m%d_%H%M%S")
+                            
+                            # Save association statistics
+                            stats_filename = os.path.join(assoc_dir, f"association_stats_{timestamp}.txt")
+                            if hasattr(localizer, 'get_association_statistics'):
+                                stats = localizer.get_association_statistics()
+                                
+                                with open(stats_filename, 'w') as f:
+                                    f.write("FEATURE ASSOCIATION STATISTICS REPORT\n")
+                                    f.write("="*50 + "\n\n")
+                                    f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                                    
+                                    for key, value in stats.items():
+                                        if isinstance(value, float):
+                                            f.write(f"{key}: {value:.4f}\n")
+                                        else:
+                                            f.write(f"{key}: {value}\n")
+                            
+                            # Save association visualization
+                            viz_filename = os.path.join(assoc_dir, f"associations_{timestamp}.png")
+                            if hasattr(localizer, 'visualize_associations_with_trajectory'):
+                                fig_save = plt.figure(figsize=(15, 10))
+                                ax = localizer.visualize_associations_with_trajectory()
+                                if ax:
+                                    plt.savefig(viz_filename, dpi=300, bbox_inches='tight')
+                                    plt.close(fig_save)
+                            
+                            print(f"\nAssociation data saved to:")
+                            print(f"  - Statistics: {stats_filename}")
+                            print(f"  - Visualization: {viz_filename}")
+                            
+                        else:
+                            print("No association data available to save.")
+                    except Exception as e:
+                        print(f"Error saving association data: {e}")
+                
+                def analyze_hybrid_performance(event):
+                    try:
+                        if hasattr(localizer, 'get_association_statistics') and hasattr(localizer, 'get_feature_extraction_statistics'):
+                            assoc_stats = localizer.get_association_statistics()
+                            feature_stats = localizer.get_feature_extraction_statistics()
+                            
+                            print(f"\n{'='*70}")
+                            print(f"HYBRID LOCALIZATION PERFORMANCE ANALYSIS")
+                            print(f"{'='*70}")
+                            
+                            # Feature extraction performance
+                            if feature_stats.get('feature_extraction_enabled', False):
+                                print(f"\nFeature Extraction:")
+                                print(f"  Average extraction time: {feature_stats.get('average_feature_time', 0):.2f}ms")
+                                print(f"  Average features per scan: {feature_stats.get('average_features_per_scan', 0):.1f}")
+                                print(f"  Average quality score: {feature_stats.get('average_quality_score', 0):.3f}")
+                            
+                            # Association performance
+                            if assoc_stats.get('feature_association_enabled', False):
+                                print(f"\nFeature Association:")
+                                print(f"  Average association time: {assoc_stats.get('average_association_time', 0):.2f}ms")
+                                print(f"  Validation success rate: {assoc_stats.get('validation_success_rate', 0)*100:.1f}%")
+                                print(f"  Total processing budget: {feature_stats.get('average_feature_time', 0) + assoc_stats.get('average_association_time', 0):.2f}ms")
+                            
+                            # Pose source analysis
+                            print(f"\nPose Source Distribution:")
+                            print(f"  Feature dominant: {assoc_stats.get('feature_dominant_rate', 0)*100:.1f}%")
+                            print(f"  ICP dominant: {assoc_stats.get('icp_dominant_rate', 0)*100:.1f}%")
+                            print(f"  Balanced fusion: {assoc_stats.get('balanced_rate', 0)*100:.1f}%")
+                            print(f"  Fallback used: {assoc_stats.get('fallback_rate', 0)*100:.1f}%")
+                            
+                            # Performance recommendations
+                            print(f"\nPerformance Assessment:")
+                            total_time = feature_stats.get('average_feature_time', 0) + assoc_stats.get('average_association_time', 0)
+                            if total_time <= 20:
+                                print("  ✅ EXCELLENT - Well within real-time budget")
+                            elif total_time <= 30:
+                                print("  ✅ GOOD - Acceptable for most applications")
+                            elif total_time <= 50:
+                                print("  ⚠️ ACCEPTABLE - May need optimization for high-frequency operation")
+                            else:
+                                print("  ❌ NEEDS OPTIMIZATION - Exceeds typical real-time budgets")
+                            
+                            print(f"{'='*70}")
+                            
+                        else:
+                            print("Hybrid performance analysis requires both feature extraction and association to be enabled.")
+                            
+                    except Exception as e:
+                        print(f"Error in hybrid performance analysis: {e}")
+                
+                # Connect button events
+                assoc_viz_button.on_clicked(show_associations)
+                assoc_stats_button.on_clicked(show_association_stats)
+                assoc_save_button.on_clicked(save_associations)
+                hybrid_analysis_button.on_clicked(analyze_hybrid_performance)
         
         # Add a Visualize ICP Process button if scan matching is enabled
         if enable_scan_matching:
-            icp_viz_button_ax = plt.axes([0.1 + button_width + button_spacing, button_y, button_width, button_height])
+            # Calculate offset based on what's already been added
+            if enable_feature_extraction and enable_feature_association and ASSOCIATION_UI_AVAILABLE:
+                button_offset = 8  # 4 feature buttons + 4 association buttons
+            elif enable_feature_extraction:
+                button_offset = 4  # 4 feature buttons only
+            else:
+                button_offset = 1  # Just the save map button
+                
+            icp_viz_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
             icp_viz_button = Button(icp_viz_button_ax, 'Visualize ICP', color='lightgreen', hovercolor='0.8')
         
             # Add a Compare Paths button
-            compare_button_ax = plt.axes([0.1 + 2 * (button_width + button_spacing), button_y, button_width, button_height])
+            if enable_feature_extraction and enable_feature_association and ASSOCIATION_UI_AVAILABLE:
+                button_offset = 9  # 4 feature + 4 association + 1 ICP button
+            elif enable_feature_extraction:
+                button_offset = 5  # 4 feature + 1 ICP button
+            else:
+                button_offset = 2  # 1 save + 1 ICP button
+                
+            compare_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
             compare_button = Button(compare_button_ax, 'Compare Paths', color='lightcoral', hovercolor='0.8')
         
-        # Add a Loop Closure Visualization button if loop closure is enabled
-        if enable_loop_closure and enable_scan_matching:
-            loop_viz_button_ax = plt.axes([0.1 + 3 * (button_width + button_spacing), button_y, button_width, button_height])
-            loop_viz_button = Button(loop_viz_button_ax, 'Loop Closures', color='lightsalmon', hovercolor='0.8')
+            # Add a Loop Closure Visualization button if loop closure is enabled
+            if enable_loop_closure and enable_scan_matching:
+                # Calculate offset based on what's already been added
+                if enable_feature_extraction and enable_feature_association and ASSOCIATION_UI_AVAILABLE:
+                    button_offset = 10  # 4 feature + 4 association + 1 ICP + 1 compare
+                elif enable_feature_extraction:
+                    button_offset = 6   # 4 feature + 1 ICP + 1 compare
+                else:
+                    button_offset = 3   # 1 save + 1 ICP + 1 compare
+                    
+                loop_viz_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
+                loop_viz_button = Button(loop_viz_button_ax, 'Loop Closures', color='lightsalmon', hovercolor='0.8')
         
         def save_map(event):
             if not show_occupancy_grid:
@@ -280,6 +578,99 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         
         save_button.on_clicked(save_map)
         
+        # Feature extraction button handlers
+        if enable_feature_extraction and enable_scan_matching and localizer:
+            def show_features(event):
+                try:
+                    # Create feature visualization
+                    feature_fig, feature_ax = plt.subplots(figsize=(12, 10))
+                    localizer.visualize_features_with_trajectory(ax=feature_ax, show_curvatures=False)
+                    plt.title('Extracted Features with Robot Trajectory')
+                    plt.tight_layout()
+                    plt.show()
+                    
+                    # Also create curvature visualization
+                    curvature_fig, curvature_ax = plt.subplots(figsize=(12, 10))
+                    localizer.visualize_features_with_trajectory(ax=curvature_ax, show_curvatures=True)
+                    plt.title('Features Colored by Curvature Strength')
+                    plt.tight_layout()
+                    plt.show()
+                    
+                except Exception as e:
+                    print(f"Error creating feature visualization: {e}")
+            
+            def show_feature_stats(event):
+                try:
+                    stats = localizer.get_feature_extraction_statistics()
+                    if stats.get('feature_extraction_enabled', False):
+                        print(f"\n{'='*60}")
+                        print(f"FEATURE EXTRACTION STATISTICS")
+                        print(f"{'='*60}")
+                        print(f"Total extractions: {stats['total_extractions']}")
+                        print(f"Total features: {stats['total_features_extracted']}")
+                        print(f"Average features per scan: {stats['average_features_per_scan']:.1f}")
+                        print(f"Average extraction time: {stats['average_feature_time']:.2f} ms")
+                        
+                        if 'average_quality_score' in stats:
+                            print(f"Average quality score: {stats['average_quality_score']:.3f}")
+                            print(f"Quality range: {stats['min_quality_score']:.3f} - {stats['max_quality_score']:.3f}")
+                            print(f"Feature count range: {stats['min_features_per_scan']} - {stats['max_features_per_scan']}")
+                        
+                        # Performance assessment
+                        if stats.get('performance_excellent', False):
+                            print("Performance: ✓ EXCELLENT (≤15ms per scan)")
+                        elif stats.get('performance_good', False):
+                            print("Performance: ⚠ GOOD (15-25ms per scan)")
+                        else:
+                            print("Performance: ⚠ NEEDS OPTIMIZATION (>25ms per scan)")
+                        
+                        # Quality assessment
+                        if stats.get('quality_excellent', False):
+                            print("Quality: ✓ EXCELLENT (≥0.7)")
+                        elif stats.get('quality_good', False):
+                            print("Quality: ✓ GOOD (0.5-0.7)")
+                        elif stats.get('quality_acceptable', False):
+                            print("Quality: ⚠ ACCEPTABLE (0.3-0.5)")
+                        else:
+                            print("Quality: ⚠ NEEDS IMPROVEMENT (<0.3)")
+                        
+                        print(f"{'='*60}")
+                    else:
+                        print("Feature extraction statistics not available.")
+                except Exception as e:
+                    print(f"Error retrieving feature statistics: {e}")
+            
+            def save_features(event):
+                try:
+                    if hasattr(localizer, 'feature_extractor') and localizer.feature_extractor:
+                        # Create feature output directory
+                        feature_dir = os.path.join(maps_dir, "features")
+                        if not os.path.exists(feature_dir):
+                            os.makedirs(feature_dir)
+                        
+                        # Generate timestamp-based filename
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        
+                        # Save feature data in JSON format
+                        json_filename = os.path.join(feature_dir, f"features_{timestamp}.json")
+                        localizer.feature_extractor.save_feature_data(json_filename, format='json')
+                        
+                        # Save feature data in CSV format
+                        csv_filename = os.path.join(feature_dir, f"features_{timestamp}.csv")
+                        localizer.feature_extractor.save_feature_data(csv_filename, format='csv')
+                        
+                        print(f"\nFeature data saved to:")
+                        print(f"  - {json_filename}")
+                        print(f"  - {csv_filename}")
+                    else:
+                        print("No feature data available to save.")
+                except Exception as e:
+                    print(f"Error saving feature data: {e}")
+            
+            feature_viz_button.on_clicked(show_features)
+            feature_stats_button.on_clicked(show_feature_stats)
+            save_features_button.on_clicked(save_features)
+        
         if enable_scan_matching:
             def visualize_icp_process(event):
                 # Create ICP process visualization
@@ -297,7 +688,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             
             def compare_paths(event):
                 # Create a figure to compare odometry and matched paths
-                compare_fig, compare_ax = plt.subplots(figsize=(10, 10))
+                compare_fig, compare_ax = plt.subplots(figsize=(12, 10))
                 
                 # Plot the map
                 if show_occupancy_grid:
@@ -318,12 +709,22 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 compare_ax.scatter(odometry_path_x[-1], odometry_path_y[-1], c='red', s=100, marker='*', label='Odometry End')
                 compare_ax.scatter(robot_path_x[-1], robot_path_y[-1], c='blue', s=100, marker='*', label='Matched End')
                 
+                # Overlay features if available
+                if enable_feature_extraction and localizer and hasattr(localizer, 'feature_history'):
+                    try:
+                        # Add semi-transparent feature overlay
+                        localizer.visualize_features_with_trajectory(ax=compare_ax, show_curvatures=False)
+                        compare_ax.set_title('Path Comparison with Extracted Features')
+                    except:
+                        compare_ax.set_title('Odometry vs. Scan-Matched Path Comparison')
+                else:
+                    compare_ax.set_title('Odometry vs. Scan-Matched Path Comparison')
+                
                 # Add grid, labels, and legend
                 compare_ax.grid(True)
                 compare_ax.set_aspect('equal')
                 compare_ax.set_xlabel('X (meters)')
                 compare_ax.set_ylabel('Y (meters)')
-                compare_ax.set_title('Odometry vs. Scan-Matched Path Comparison')
                 compare_ax.legend(loc='upper right')
                 
                 plt.tight_layout()
@@ -379,7 +780,11 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     
     # Add scan matching status if enabled
     if enable_scan_matching:
-        match_text = ax.text(0.02, 0.98, "Using Improved ICP Scan Matching", 
+        status_text = "Using Improved ICP Scan Matching"
+        if enable_feature_extraction:
+            status_text += " + Feature Extraction"
+        
+        match_text = ax.text(0.02, 0.98, status_text, 
                             transform=ax.transAxes, va='top', ha='left', 
                             color='green', fontsize=10,
                             bbox=dict(facecolor='white', alpha=0.7))
@@ -396,6 +801,20 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                                    transform=ax.transAxes, va='top', ha='left', 
                                    color='blue', fontsize=10,
                                    bbox=dict(facecolor='white', alpha=0.7))
+        
+        # Add feature extraction status if enabled
+        if enable_feature_extraction and localizer:
+            stats = localizer.get_feature_extraction_statistics()
+            if stats.get('feature_extraction_enabled', False):
+                feature_text = (f"Features: {stats['total_features_extracted']} total, "
+                               f"{stats['average_features_per_scan']:.1f} avg/scan, "
+                               f"{stats['average_feature_time']:.1f}ms avg time")
+                
+                y_pos = 0.90 if enable_loop_closure else 0.94
+                feature_status_text = ax.text(0.02, y_pos, feature_text, 
+                                             transform=ax.transAxes, va='top', ha='left', 
+                                             color='purple', fontsize=10,
+                                             bbox=dict(facecolor='white', alpha=0.7))
     
     # Add grid and labels
     ax.grid(True)
@@ -440,13 +859,37 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         print(f"\nFinal occupancy grid map saved to:")
         for file in saved_files:
             print(f"  - {file}")
+    
+    # Save feature data if feature extraction was enabled
+    if enable_feature_extraction and enable_scan_matching and localizer and hasattr(localizer, 'feature_extractor'):
+        if save_grid:  # Only auto-save if user wants to save other data
+            try:
+                # Create feature output directory
+                feature_dir = os.path.join(maps_dir, "features")
+                if not os.path.exists(feature_dir):
+                    os.makedirs(feature_dir)
+                
+                # Generate timestamp-based filename
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                feature_filename = os.path.join(feature_dir, f"features_{timestamp}")
+                
+                # Save in both formats
+                localizer.feature_extractor.save_feature_data(feature_filename + ".json", format='json')
+                localizer.feature_extractor.save_feature_data(feature_filename + ".csv", format='csv')
+                
+                print(f"\nFeature data auto-saved to:")
+                print(f"  - {feature_filename}.json")
+                print(f"  - {feature_filename}.csv")
+            except Exception as e:
+                print(f"Warning: Could not auto-save feature data: {e}")
             
     # Return key components for further use if needed
     return {
         'occupancy_grid': occupancy_grid,
-        'localizer': localizer if enable_scan_matching else None,
+        'localizer': localizer,
         'robot_path': list(zip(robot_path_x, robot_path_y)),
-        'scan_data': parsed_data_list
+        'scan_data': parsed_data_list,
+        'feature_extraction_enabled': enable_feature_extraction
     }
 
 
@@ -457,12 +900,12 @@ def main():
     import argparse
     
     # Create argument parser
-    parser = argparse.ArgumentParser(description='LiDAR Visualization, Localization, and Loop Closure')
+    parser = argparse.ArgumentParser(description='LiDAR Visualization, Localization, Loop Closure, and Feature Extraction')
     
     # Add arguments
     parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=3000,
+    parser.add_argument('--max_entries', type=int, default=5000,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
@@ -476,6 +919,10 @@ def main():
                        help='Enable scan matching localization algorithm')
     parser.add_argument('--loop_closure', action='store_true', default=True,
                        help='Enable loop closure detection')
+    parser.add_argument('--feature_extraction', action='store_true', default=True,
+                       help='Enable feature extraction alongside ICP scan matching')
+    parser.add_argument('--feature_association', action='store_true', default=True,
+                       help='Enable feature association and hybrid pose estimation')
     parser.add_argument('--rebuild_map', action='store_true', default=True,
                        help='Rebuild map after loop closure optimization')
     parser.add_argument('--debug', type=int, default=1, choices=[0, 1, 2, 3],
@@ -494,6 +941,8 @@ def main():
         save_format=args.format,
         enable_scan_matching=args.scan_matching,
         enable_loop_closure=args.loop_closure,
+        enable_feature_extraction=args.feature_extraction,
+        enable_feature_association=args.feature_association,
         rebuild_map=args.rebuild_map
     )
 

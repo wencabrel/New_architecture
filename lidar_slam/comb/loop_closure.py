@@ -7,7 +7,7 @@ from scipy.spatial.distance import cdist
 from sklearn.neighbors import NearestNeighbors
 from scipy.linalg import svd
 
-from ScanMatcher import PoseEstimate
+from pose_estimate import PoseEstimate
 from lidar_utility_functions import convert_scans_to_cartesian
 
 
@@ -979,6 +979,11 @@ def visualize_loop_closure_results(scan_matcher_obj, occupancy_grid):
     """
     if not hasattr(scan_matcher_obj, 'loop_detector') or not scan_matcher_obj.enable_loop_closure:
         print("Loop closure is not enabled on this scan matcher object.")
+        return
+    
+    # Only plot if we have loop closures detected
+    if not scan_matcher_obj.loop_detector.detected_loops:
+        print("No loop closures detected to visualize.")
         return
     
     # Create a figure with multiple subplots
