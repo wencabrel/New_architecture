@@ -33,6 +33,98 @@ try:
 except ImportError:
     print("Note: Feature association UI components not available. Association controls will be disabled.")
     ASSOCIATION_UI_AVAILABLE = False
+    
+def debug_hybrid_pose_issue(localizer):
+    """Debug the hybrid pose statistics issue in detail"""
+    print("\n=== DEBUGGING HYBRID POSE STATISTICS ISSUE ===")
+    
+    if not hasattr(localizer, 'hybrid_estimator'):
+        print("❌ No hybrid_estimator found")
+        return None
+    
+    estimator = localizer.hybrid_estimator
+    stats = estimator.estimation_stats
+    
+    print(f"Raw statistics:")
+    print(f"  total_estimations: {stats['total_estimations']}")
+    print(f"  feature_dominant: {stats['feature_dominant']}")
+    print(f"  icp_dominant: {stats['icp_dominant']}")
+    print(f"  balanced: {stats['balanced']}")
+    print(f"  fallback_to_odometry: {stats['fallback_to_odometry']}")
+    print(f"  rejected_poses: {stats.get('rejected_poses', 'N/A')}")
+    
+    # Calculate what's tracked vs untracked
+    total = stats['total_estimations']
+    tracked = (stats['feature_dominant'] + stats['icp_dominant'] + 
+              stats['balanced'] + stats['fallback_to_odometry'])
+    untracked = total - tracked
+    
+    print(f"\nTracking analysis:")
+    print(f"  Total: {total}")
+    print(f"  Tracked: {tracked}")
+    print(f"  Untracked: {untracked}")
+    
+    if untracked > 0:
+        print(f"\n❌ PROBLEM: {untracked} estimations are untracked!")
+        print(f"   This explains why all percentages are 0%")
+    
+    return stats
+
+def fix_case1_statistics_tracking(localizer):
+    """Fix the missing statistics tracking in recovery paths"""
+    
+    if not hasattr(localizer, 'hybrid_estimator'):
+        print("❌ No hybrid estimator found")
+        return False
+    
+    estimator = localizer.hybrid_estimator
+    
+    # Store original method if not already stored
+    if not hasattr(estimator, '_original_estimate_hybrid_pose'):
+        estimator._original_estimate_hybrid_pose = estimator.estimate_hybrid_pose
+    
+    def estimate_hybrid_pose_with_fixed_tracking(*args, **kwargs):
+        """Wrapper that fixes the missing statistics tracking"""
+        # Store stats before calling original method
+        stats_before = estimator.estimation_stats.copy()
+        
+        # Call original method
+        result = estimator._original_estimate_hybrid_pose(*args, **kwargs)
+        
+        # Check if statistics were properly updated
+        stats_after = estimator.estimation_stats
+        total_before = stats_before['total_estimations']
+        total_after = stats_after['total_estimations']
+        
+        # If total increased but no category was incremented, fix it
+        if total_after > total_before:
+            tracked_before = (stats_before['feature_dominant'] + stats_before['icp_dominant'] + 
+                            stats_before['balanced'] + stats_before['fallback_to_odometry'])
+            tracked_after = (stats_after['feature_dominant'] + stats_after['icp_dominant'] + 
+                           stats_after['balanced'] + stats_after['fallback_to_odometry'])
+            
+            # If no category was incremented, this was an untracked case
+            if tracked_after == tracked_before:
+                if result.source.value == 'recovery':
+                    estimator.estimation_stats['fallback_to_odometry'] += 1
+                    print(f"[FIX] Tracked recovery case as fallback")
+                elif result.source.value == 'feature_based':
+                    estimator.estimation_stats['feature_dominant'] += 1
+                    print(f"[FIX] Tracked feature-based case")
+                elif result.source.value == 'icp_based':
+                    estimator.estimation_stats['icp_dominant'] += 1
+                    print(f"[FIX] Tracked ICP-based case")
+                else:
+                    estimator.estimation_stats['fallback_to_odometry'] += 1
+                    print(f"[FIX] Tracked unknown case as fallback")
+        
+        return result
+    
+    # Apply the fix
+    estimator.estimate_hybrid_pose = estimate_hybrid_pose_with_fixed_tracking
+    
+    print("✅ Statistics tracking fix applied!")
+    return True
 
 # Modifications to main.py for feature extraction integration
 
@@ -1257,7 +1349,7 @@ def main():
     # Add arguments
     parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=150,
+    parser.add_argument('--max_entries', type=int, default=30,
                        help='Maximum number of entries to rea0d from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
