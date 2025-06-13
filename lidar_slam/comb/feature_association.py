@@ -5,11 +5,11 @@ from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
 import copy
+from pose_estimate import PoseEstimate
 
 # Import existing components (assuming they're available)
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from pose_estimate import PoseEstimate
     DEPENDENCIES_AVAILABLE = True
 except ImportError:
     print("Warning: Some dependencies not available. Feature association will have limited functionality.")

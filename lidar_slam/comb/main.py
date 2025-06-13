@@ -36,28 +36,14 @@ except ImportError:
 
 # Modifications to main.py for feature extraction integration
 
-# Import new feature-based components
-try:
-    from feature_extraction import LiDARFeatureExtractor, LiDARFeature
-    from data_association import DataAssociation, FeatureMatch
-    from feature_slam_integration import FeatureBasedScanMatcher, integrate_features_with_existing_slam, compare_slam_performance
-    FEATURES_AVAILABLE = True
-    print("[Main] Feature-based SLAM components loaded successfully")
-except ImportError as e:
-    FEATURES_AVAILABLE = False
-    print(f"[Main] Warning: Feature-based SLAM components not available: {e}")
-    print("[Main] Falling back to standard point-based SLAM")
-
 def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_grid=True, 
                              grid_resolution=0.05, save_grid=True, save_format='all',
                              enable_scan_matching=True, enable_loop_closure=True,
-                             enable_features=True, feature_mode='hybrid',
                              enable_feature_extraction=False, enable_feature_association=False, 
                              rebuild_map=True):
     """
     Main function to visualize LiDAR data in real-time with occupancy grid mapping, 
     scan matching, loop closure detection, feature extraction, and feature association
-    scan matching, loop closure detection, and optional feature-based enhancements
     
     Args:
         file_path: Path to the LiDAR data file
@@ -70,8 +56,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         enable_loop_closure: Whether to enable loop closure detection
         enable_feature_extraction: Whether to enable feature extraction alongside ICP
         enable_feature_association: Whether to enable feature association and hybrid poses
-        enable_features: Whether to enable feature-based scan matching
-        feature_mode: Feature mode ('feature_only', 'hybrid', 'point_only')
         rebuild_map: Whether to rebuild the map after loop closure optimization
     """
     
@@ -81,11 +65,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     if not os.path.exists(file_path):
         print(f"Error: File {file_path} does not exist.")
         return
-    
-    # Validate feature settings
-    if enable_features and not FEATURES_AVAILABLE:
-        print("Warning: Features requested but not available. Disabling feature-based matching.")
-        enable_features = False
     
     # Read the data from file
     parsed_data_list = read_lidar_data_from_file(file_path, max_entries)
@@ -107,11 +86,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     if show_occupancy_grid:
         print(f"  Starting visualization with occupancy grid mapping (resolution: {grid_resolution}m)...")
         if enable_scan_matching:
-            if enable_features and FEATURES_AVAILABLE:
-                print(f"  Feature-based scan matching is ENABLED - mode: {feature_mode}")
-                print(f"  Enhanced ICP with geometric features (corners, lines, curves)")
-            else:
-                print(f"  Point-based scan matching is ENABLED - using ICP with adaptive parameters")
+            print(f"  Scan matching is ENABLED - using ICP with adaptive parameters")
         if enable_loop_closure and enable_scan_matching:
             print(f"  Loop closure detection is ENABLED - using Scan Context descriptors and pose graph optimization")
         if enable_feature_extraction and enable_scan_matching:
@@ -173,10 +148,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     else:
         occupancy_grid = None
     
-    # Initialize scan matching localization
-    localizer = None
-    comparison_results = None
-    
+    # Initialize scan matching localization if enabled
     if enable_scan_matching:
         print(f"  Using improved ICP scan matching algorithm with motion validation")
         
@@ -197,37 +169,12 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             enable_feature_extraction=enable_feature_extraction,
             enable_feature_association=enable_feature_association
         )
-        if enable_features and FEATURES_AVAILABLE:
-            print(f"  Initializing feature-based SLAM system...")
-            
-            # Create feature-based scan matcher
-            localizer = FeatureBasedScanMatcher(
-                occupancy_grid=occupancy_grid,
-                debug_level=1,
-                use_features=(feature_mode != 'point_only'),
-                hybrid_mode=(feature_mode == 'hybrid')
-            )
-            
-            print(f"  ✓ Feature extraction: {'Enabled' if localizer.use_features else 'Disabled'}")
-            print(f"  ✓ Hybrid mode: {'Enabled' if localizer.hybrid_mode else 'Disabled'}")
-            print(f"  ✓ Base scan matching: Inherited from ImprovedScanMatchingLocalization")
-            
-            # Optional: Create comparison with point-based approach
-            if feature_mode == 'hybrid':
-                print(f"  ✓ Will compare feature vs point-based performance")
-                
-        else:
-            print(f"  Initializing standard point-based SLAM system...")
-            localizer = ImprovedScanMatchingLocalization(occupancy_grid, debug_level=1)
         
         # Enable loop closure if requested
         if enable_loop_closure:
             localizer = integrate_with_scan_matcher(localizer, loop_closure_enabled=True)
         
         # Process sensor data to build trajectory with scan matching
-        print(f"\nProcessing {len(parsed_data_list)} LiDAR scans...")
-        start_time = time.time()
-        
         localizer.processSensorData(
             parsed_data_list,
             angle_min=angle_min,
@@ -237,9 +184,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             reverse_scan=True,
             flip_theta=False
         )
-        
-        processing_time = time.time() - start_time
-        print(f"✓ Processing completed in {processing_time:.2f} seconds")
         
         # Extract trajectory for visualization
         trajectory = localizer.trajectory
@@ -251,17 +195,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         odometry_path_x = [pose.x for pose in odometry_trajectory]
         odometry_path_y = [pose.y for pose in odometry_trajectory]
         
-        # Print performance statistics
-        if enable_features and FEATURES_AVAILABLE and hasattr(localizer, 'get_feature_statistics'):
-            feature_stats = localizer.get_feature_statistics()
-            print(f"\nFeature-based SLAM Statistics:")
-            print(f"  Total features extracted: {feature_stats['total_features_extracted']}")
-            print(f"  Features per frame: {feature_stats['features_per_frame']:.1f}")
-            print(f"  Successful feature matches: {feature_stats['successful_matches']}")
-            print(f"  Match success rate: {feature_stats['success_rate']:.1%}")
-            if feature_stats['hybrid_corrections'] > 0:
-                print(f"  Hybrid corrections applied: {feature_stats['hybrid_corrections']}")
-        
         # Process loop closures after the entire trajectory has been processed
         if enable_loop_closure:
             print("\nChecking for loop closures in the trajectory...")
@@ -272,7 +205,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 reverse_scan=True, flip_theta=False
             )
             
-            if hasattr(localizer, 'loop_closures_detected') and localizer.loop_closures_detected > 0 and localizer.is_optimized:
+            if localizer.loop_closures_detected > 0 and localizer.is_optimized:
                 print(f"Found and processed {localizer.loop_closures_detected} loop closures!")
                 
                 # Update map and trajectory if requested
@@ -318,8 +251,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         ax2.grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
         
         # Create a line for robot path on the occupancy grid
-        path_label = 'Feature-based Path' if (enable_features and FEATURES_AVAILABLE) else 'Scan-matched Path'
-        grid_path_line, = ax2.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label=path_label)
+        grid_path_line, = ax2.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label='Matched Path')
         
         # Create a line for odometry path if scan matching is enabled
         if enable_scan_matching:
@@ -336,8 +268,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         # Button positions
         button_width = 0.07
         button_spacing = 0.01
-        button_width = 0.12
-        button_spacing = 0.02
         button_height = 0.04
         button_y = 0.05
         button_x_start = 0.05
@@ -345,9 +275,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
         # Add a Save Map button
         save_button_ax = plt.axes([button_x_start, button_y, button_width, button_height])
         save_button = Button(save_button_ax, 'Save Map', color='lightblue', hovercolor='0.8')
-        
-        # Add buttons based on available functionality
-        button_x = 0.1 + button_width + button_spacing
         
         # Add feature extraction related buttons if enabled
         if enable_feature_extraction and enable_scan_matching and localizer:
@@ -589,10 +516,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 button_offset = 1  # Just the save map button
                 
             icp_viz_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
-        if enable_scan_matching and localizer:
-            icp_viz_button_ax = plt.axes([button_x, button_y, button_width, button_height])
             icp_viz_button = Button(icp_viz_button_ax, 'Visualize ICP', color='lightgreen', hovercolor='0.8')
-            button_x += button_width + button_spacing
         
             # Add a Compare Paths button
             if enable_feature_extraction and enable_feature_association and ASSOCIATION_UI_AVAILABLE:
@@ -603,21 +527,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 button_offset = 2  # 1 save + 1 ICP button
                 
             compare_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
-            compare_button_ax = plt.axes([button_x, button_y, button_width, button_height])
             compare_button = Button(compare_button_ax, 'Compare Paths', color='lightcoral', hovercolor='0.8')
-            button_x += button_width + button_spacing
-        
-        # Add feature-specific buttons if features are enabled
-        if enable_features and FEATURES_AVAILABLE and hasattr(localizer, 'visualize_feature_matches'):
-            feature_viz_button_ax = plt.axes([button_x, button_y, button_width, button_height])
-            feature_viz_button = Button(feature_viz_button_ax, 'Show Features', color='lightyellow', hovercolor='0.8')
-            button_x += button_width + button_spacing
-            
-            # Performance comparison button
-            if feature_mode == 'hybrid':
-                perf_button_ax = plt.axes([button_x, button_y, button_width, button_height])
-                perf_button = Button(perf_button_ax, 'Performance', color='lightpink', hovercolor='0.8')
-                button_x += button_width + button_spacing
         
             # Add a Loop Closure Visualization button if loop closure is enabled
             if enable_loop_closure and enable_scan_matching:
@@ -631,12 +541,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                     
                 loop_viz_button_ax = plt.axes([button_x_start + button_offset*(button_width + button_spacing), button_y, button_width, button_height])
                 loop_viz_button = Button(loop_viz_button_ax, 'Loop Closures', color='lightsalmon', hovercolor='0.8')
-        # Add a Loop Closure Visualization button if loop closure is enabled
-        if enable_loop_closure and enable_scan_matching and localizer:
-            loop_viz_button_ax = plt.axes([button_x, button_y, button_width, button_height])
-            loop_viz_button = Button(loop_viz_button_ax, 'Loop Closures', color='lightsalmon', hovercolor='0.8')
         
-        # Define button handlers
         def save_map(event):
             if not show_occupancy_grid:
                 print("Cannot save map - occupancy grid is disabled.")
@@ -648,8 +553,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             
             # Generate a timestamp-based filename
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            feature_suffix = "_feature" if (enable_features and FEATURES_AVAILABLE) else "_point"
-            base_filename = os.path.join(maps_dir, f"occupancy_grid{feature_suffix}_{timestamp}")
+            base_filename = os.path.join(maps_dir, f"occupancy_grid_{timestamp}")
             
             # Create path coordinates for saving
             robot_path_coords = list(zip(robot_path_x, robot_path_y))
@@ -798,8 +702,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 
                 # Plot both paths
                 compare_ax.plot(odometry_path_x, odometry_path_y, 'r-', linewidth=2, label='Odometry Path')
-                path_label = 'Feature-based Path' if (enable_features and FEATURES_AVAILABLE) else 'Scan-matched Path'
-                compare_ax.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label=path_label)
+                compare_ax.plot(robot_path_x, robot_path_y, 'b-', linewidth=2, label='Matched Path')
                 
                 # Plot start and end points
                 compare_ax.scatter(odometry_path_x[0], odometry_path_y[0], c='green', s=100, marker='*', label='Start')
@@ -822,8 +725,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 compare_ax.set_aspect('equal')
                 compare_ax.set_xlabel('X (meters)')
                 compare_ax.set_ylabel('Y (meters)')
-                title = 'Odometry vs. Feature-based SLAM' if (enable_features and FEATURES_AVAILABLE) else 'Odometry vs. Point-based SLAM'
-                compare_ax.set_title(title)
                 compare_ax.legend(loc='upper right')
                 
                 plt.tight_layout()
@@ -831,57 +732,11 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             
             compare_button.on_clicked(compare_paths)
         
-        # Add feature-specific button handlers
-        if enable_features and FEATURES_AVAILABLE and hasattr(localizer, 'visualize_feature_matches'):
-            def show_features(event):
-                # Get the last scan data
-                last_scan = parsed_data_list[-1]
-                scan_x, scan_y = convert_scans_to_cartesian(
-                    last_scan['scan_ranges'], angle_min, angle_max, last_scan['pose'],
-                    flip_x=False, flip_y=False, reverse_scan=True, flip_theta=False
-                )
-                
-                # Create feature visualization
-                fig = localizer.visualize_feature_matches(scan_x, scan_y, localizer.trajectory[-1])
-                plt.show()
-            
-            feature_viz_button.on_clicked(show_features)
-            
-            if feature_mode == 'hybrid':
-                def show_performance(event):
-                    # Show feature statistics
-                    stats = localizer.get_feature_statistics()
-                    
-                    # Create performance visualization
-                    perf_fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-                    
-                    # Feature extraction statistics
-                    categories = ['Successful\nMatches', 'Failed\nMatches', 'Hybrid\nCorrections']
-                    values = [stats['successful_matches'], stats['failed_matches'], stats['hybrid_corrections']]
-                    colors = ['green', 'red', 'orange']
-                    
-                    ax1.bar(categories, values, color=colors, alpha=0.7)
-                    ax1.set_title('Feature Matching Performance')
-                    ax1.set_ylabel('Count')
-                    
-                    # Success rate pie chart
-                    success_data = [stats['successful_matches'], stats['failed_matches']]
-                    labels = ['Successful', 'Failed']
-                    colors = ['green', 'red']
-                    
-                    ax2.pie(success_data, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-                    ax2.set_title(f'Match Success Rate\n({stats["success_rate"]:.1%} overall)')
-                    
-                    plt.tight_layout()
-                    plt.show()
-                
-                perf_button.on_clicked(show_performance)
-        
         # Add Loop Closure Visualization button handler
-        if enable_loop_closure and enable_scan_matching and localizer:
+        if enable_loop_closure and enable_scan_matching:
             def show_loop_closures(event):
                 if hasattr(localizer, 'loop_detector'):
-                    if hasattr(localizer, 'loop_closures_detected') and localizer.loop_closures_detected > 0:
+                    if localizer.loop_closures_detected > 0:
                         visualize_loop_closure_results(localizer, occupancy_grid)
                     else:
                         print("No loop closures were detected.")
@@ -891,15 +746,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
             loop_viz_button.on_clicked(show_loop_closures)
         
         # Set occupancy grid plot properties
-        grid_title = "Occupancy Grid Map"
-        if enable_features and FEATURES_AVAILABLE:
-            grid_title += f" (Feature-based SLAM - {feature_mode})"
-        elif enable_scan_matching:
-            grid_title += " (Point-based SLAM)"
-        else:
-            grid_title += " (Odometry only)"
-            
-        ax2.set_title(grid_title)
+        ax2.set_title('Occupancy Grid Map')
         ax2.set_xlabel('X (meters)')
         ax2.set_ylabel('Y (meters)')
         ax2.set_aspect('equal')
@@ -925,15 +772,13 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     robot_pos = ax.scatter(last_x, last_y, c='red', s=100, marker='*', label='Final Position')
     
     # Create a line for robot path
-    path_label = 'Feature-based Path' if (enable_features and FEATURES_AVAILABLE) else 'Robot Path'
-    path_line, = ax.plot(robot_path_x, robot_path_y, 'g-', linewidth=2, label=path_label)
+    path_line, = ax.plot(robot_path_x, robot_path_y, 'g-', linewidth=2, label='Robot Path')
     
     # Create a line for odometry path if scan matching is enabled
     if enable_scan_matching:
         odom_line, = ax.plot(odometry_path_x, odometry_path_y, 'r--', linewidth=1, alpha=0.6, label='Odometry Path')
     
     # Add scan matching status if enabled
-    status_y = 0.98
     if enable_scan_matching:
         status_text = "Using Improved ICP Scan Matching"
         if enable_feature_extraction:
@@ -943,38 +788,16 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                             transform=ax.transAxes, va='top', ha='left', 
                             color='green', fontsize=10,
                             bbox=dict(facecolor='white', alpha=0.7))
-        if enable_features and FEATURES_AVAILABLE:
-            match_text = ax.text(0.02, status_y, f"Feature-based SLAM ({feature_mode} mode)", 
-                                transform=ax.transAxes, va='top', ha='left', 
-                                color='green', fontsize=10,
-                                bbox=dict(facecolor='white', alpha=0.7))
-            status_y -= 0.04
-            
-            # Add feature statistics
-            if hasattr(localizer, 'get_feature_statistics'):
-                stats = localizer.get_feature_statistics()
-                stats_text = ax.text(0.02, status_y, 
-                                   f"Features: {stats['current_features']}, Success: {stats['success_rate']:.1%}", 
-                                   transform=ax.transAxes, va='top', ha='left', 
-                                   color='blue', fontsize=9,
-                                   bbox=dict(facecolor='white', alpha=0.7))
-                status_y -= 0.04
-        else:
-            match_text = ax.text(0.02, status_y, "Point-based SLAM (ICP)", 
-                                transform=ax.transAxes, va='top', ha='left', 
-                                color='green', fontsize=10,
-                                bbox=dict(facecolor='white', alpha=0.7))
-            status_y -= 0.04
         
         # Add loop closure status if enabled
         if enable_loop_closure:
             if hasattr(localizer, 'loop_closures_detected') and localizer.loop_closures_detected > 0:
-                loop_text = ax.text(0.02, status_y, f"Loop Closures Detected: {localizer.loop_closures_detected}", 
+                loop_text = ax.text(0.02, 0.94, f"Loop Closures Detected: {localizer.loop_closures_detected}", 
                                    transform=ax.transAxes, va='top', ha='left', 
                                    color='blue', fontsize=10,
                                    bbox=dict(facecolor='white', alpha=0.7))
             else:
-                loop_text = ax.text(0.02, status_y, "Loop Closure Detection Enabled", 
+                loop_text = ax.text(0.02, 0.94, "Loop Closure Detection Enabled", 
                                    transform=ax.transAxes, va='top', ha='left', 
                                    color='blue', fontsize=10,
                                    bbox=dict(facecolor='white', alpha=0.7))
@@ -998,16 +821,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     ax.set_aspect('equal')
     ax.set_xlabel('X (meters)')
     ax.set_ylabel('Y (meters)')
-    
-    # Set title based on configuration
-    title = '2D LiDAR SLAM Visualization'
-    if enable_features and FEATURES_AVAILABLE:
-        title += f' (Feature-based - {feature_mode})'
-    elif enable_scan_matching:
-        title += ' (Point-based)'
-    else:
-        title += ' (Odometry only)'
-    ax.set_title(title)
+    ax.set_title('2D LiDAR Scan Visualization')
     
     # Set axis limits
     ax.set_xlim(x_min, x_max)
@@ -1023,8 +837,7 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     if save_grid and show_occupancy_grid:
         # Generate a timestamp-based filename
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        feature_suffix = "_feature" if (enable_features and FEATURES_AVAILABLE) else "_point"
-        base_filename = os.path.join(maps_dir, f"final_map{feature_suffix}_{timestamp}")
+        base_filename = os.path.join(maps_dir, f"final_map_{timestamp}")
         
         # Create path coordinates for saving
         robot_path_coords = list(zip(robot_path_x, robot_path_y))
@@ -1074,7 +887,6 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
     return {
         'occupancy_grid': occupancy_grid,
         'localizer': localizer,
-        'localizer': localizer,
         'robot_path': list(zip(robot_path_x, robot_path_y)),
         'scan_data': parsed_data_list,
         'feature_extraction_enabled': enable_feature_extraction
@@ -1089,12 +901,11 @@ def main():
     
     # Create argument parser
     parser = argparse.ArgumentParser(description='LiDAR Visualization, Localization, Loop Closure, and Feature Extraction')
-    parser = argparse.ArgumentParser(description='LiDAR Visualization, Localization, Loop Closure, and Feature-based SLAM')
     
     # Add arguments
     parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=10000,
+    parser.add_argument('--max_entries', type=int, default=200,
                        help='Maximum number of entries to read from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
@@ -1117,39 +928,11 @@ def main():
     parser.add_argument('--debug', type=int, default=1, choices=[0, 1, 2, 3],
                        help='Debug level (0=none, 1=basic, 2=detailed, 3=verbose)')
     
-    # NEW: Feature-based SLAM arguments
-    parser.add_argument('--features', action='store_true', default=True,
-                       help='Enable feature-based scan matching (requires feature modules)')
-    parser.add_argument('--feature_mode', type=str, default='hybrid', 
-                       choices=['feature_only', 'hybrid', 'point_only'],
-                       help='Feature matching mode: feature_only, hybrid (features+points), or point_only')
-    
     # Parse arguments
     args = parser.parse_args()
     
-    # Print configuration
-    print("="*80)
-    print("LIDAR SLAM SYSTEM CONFIGURATION")
-    print("="*80)
-    print(f"Data file: {args.file}")
-    print(f"Max entries: {args.max_entries}")
-    print(f"Scan matching: {'Enabled' if args.scan_matching else 'Disabled'}")
-    print(f"Loop closure: {'Enabled' if args.loop_closure else 'Disabled'}")
-    print(f"Features: {'Enabled' if args.features else 'Disabled'}")
-    if args.features:
-        print(f"Feature mode: {args.feature_mode}")
-    print(f"Grid resolution: {args.resolution}m")
-    print(f"Save maps: {'Enabled' if args.save else 'Disabled'}")
-    print("="*80 + "\n")
-    
-    # Check feature availability
-    if args.features and not FEATURES_AVAILABLE:
-        print("WARNING: Feature-based SLAM requested but feature modules not available!")
-        print("Either install the feature modules or run with --no-features")
-        print("Continuing with point-based SLAM only...\n")
-    
     # Run the visualization
-    result = visualize_lidar_data_realtime(
+    visualize_lidar_data_realtime(
         file_path=args.file,
         max_entries=args.max_entries,
         show_occupancy_grid=args.grid,
@@ -1160,27 +943,8 @@ def main():
         enable_loop_closure=args.loop_closure,
         enable_feature_extraction=args.feature_extraction,
         enable_feature_association=args.feature_association,
-        enable_features=args.features,
-        feature_mode=args.feature_mode,
         rebuild_map=args.rebuild_map
     )
-    
-    # Print final summary
-    print("\n" + "="*80)
-    print("PROCESSING COMPLETE")
-    print("="*80)
-    
-    if result and result['feature_stats']:
-        stats = result['feature_stats']
-        print(f"Feature Statistics:")
-        print(f"  Total features extracted: {stats['total_features_extracted']}")
-        print(f"  Average per frame: {stats['features_per_frame']:.1f}")
-        print(f"  Match success rate: {stats['success_rate']:.1%}")
-    
-    if result and result['localizer'] and hasattr(result['localizer'], 'loop_closures_detected'):
-        print(f"Loop closures detected: {result['localizer'].loop_closures_detected}")
-    
-    print("="*80)
 
 # Main execution
 if __name__ == "__main__":
