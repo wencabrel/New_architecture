@@ -334,26 +334,378 @@ def visualize_lidar_data_realtime(file_path, max_entries=200, show_occupancy_gri
                 hybrid_analysis_button = Button(hybrid_analysis_button_ax, 'Hybrid Perf', color='lightcyan', hovercolor='0.8')
                 
                 def show_associations(event):
+                    """
+                    Enhanced callback function to access association data from existing components
+                    """
                     try:
                         if hasattr(localizer, 'enable_feature_association') and localizer.enable_feature_association:
-                            # Create association visualization
-                            fig_assoc = plt.figure(figsize=(15, 10))
-                            fig_assoc.suptitle('Feature Association Visualization', fontsize=16)
+                            print("Attempting to create association visualization...")
                             
-                            # Create association visualizer
-                            if hasattr(localizer, 'visualize_associations_with_trajectory'):
-                                ax = localizer.visualize_associations_with_trajectory()
-                                if ax:
-                                    plt.show()
-                                    print("Association visualization displayed.")
-                                else:
-                                    print("No association data available for visualization.")
+                            # Method 1: Try to get data from association_engine
+                            associations = []
+                            current_descriptors = []
+                            previous_descriptors = []
+                            validation_result = None
+                            
+                            if hasattr(localizer, 'association_engine') and localizer.association_engine:
+                                engine = localizer.association_engine
+                                print(f"Association engine found: {type(engine)}")
+                                
+                                # Check if engine has recent data stored
+                                if hasattr(engine, 'last_associations'):
+                                    associations = engine.last_associations or []
+                                if hasattr(engine, 'last_current_descriptors'):
+                                    current_descriptors = engine.last_current_descriptors or []
+                                if hasattr(engine, 'last_previous_descriptors'):
+                                    previous_descriptors = engine.last_previous_descriptors or []
+                                    
+                                print(f"Found {len(associations)} associations from engine")
+                            
+                            # Method 2: Try to get data from feature_history
+                            if not associations and hasattr(localizer, 'feature_history') and localizer.feature_history:
+                                print(f"Feature history available with {len(localizer.feature_history)} entries")
+                                
+                                # If we have at least 2 feature sets, try to create associations
+                                if len(localizer.feature_history) >= 2:
+                                    try:
+                                        current_features = localizer.feature_history[-1]  # Most recent
+                                        previous_features = localizer.feature_history[-2]  # Second most recent
+                                        
+                                        print(f"Creating associations from feature history...")
+                                        print(f"Current features: {len(current_features.features) if hasattr(current_features, 'features') else 'unknown'}")
+                                        print(f"Previous features: {len(previous_features.features) if hasattr(previous_features, 'features') else 'unknown'}")
+                                        
+                                        # Use the association engine to create associations
+                                        engine = localizer.association_engine
+                                        
+                                        # Create descriptors
+                                        current_descriptors = engine.create_descriptors(current_features, scan_index=1)
+                                        previous_descriptors = engine.create_descriptors(previous_features, scan_index=0)
+                                        
+                                        print(f"Created {len(current_descriptors)} current descriptors")
+                                        print(f"Created {len(previous_descriptors)} previous descriptors")
+                                        
+                                        # Perform association
+                                        if current_descriptors and previous_descriptors:
+                                            associations = engine.associate_features(
+                                                current_descriptors, 
+                                                previous_descriptors, 
+                                                motion_estimate=None
+                                            )
+                                            print(f"Generated {len(associations)} associations")
+                                            
+                                            # Try to validate associations
+                                            if hasattr(localizer, 'association_validator') and localizer.association_validator:
+                                                try:
+                                                    validation_result = localizer.association_validator.validate_associations(
+                                                        associations, current_descriptors, previous_descriptors
+                                                    )
+                                                    print(f"Validation result: {validation_result.is_valid if validation_result else 'None'}")
+                                                except Exception as e:
+                                                    print(f"Validation failed: {e}")
+                                        
+                                    except Exception as e:
+                                        print(f"Error creating associations from feature history: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                            
+                            # Method 3: Access any stored current/previous features directly
+                            if not associations:
+                                current_features = None
+                                previous_features = None
+                                
+                                # Check for stored feature sets
+                                if hasattr(localizer, 'current_features'):
+                                    current_features = localizer.current_features
+                                if hasattr(localizer, 'previous_features'):
+                                    previous_features = localizer.previous_features
+                                
+                                if current_features and previous_features:
+                                    print("Found current and previous features, creating visualization...")
+                                    create_feature_only_visualization(current_features, previous_features)
+                                    return
+                            
+                            print(f"Final result: {len(associations)} associations, {len(current_descriptors)} current, {len(previous_descriptors)} previous")
+                            
+                            # Create visualization if we have data
+                            if associations and current_descriptors and previous_descriptors:
+                                try:
+                                    # Try to import and use the full visualizer
+                                    try:
+                                        from association_visualizer import AssociationVisualizer, VisualizationConfig
+                                        
+                                        config = VisualizationConfig()
+                                        config.show_all_associations = True
+                                        config.show_quality_metrics = True
+                                        config.figure_size = (15, 10)
+                                        
+                                        visualizer = AssociationVisualizer(config=config, save_plots=False)
+                                        
+                                        fig = visualizer.visualize_associations(
+                                            current_descriptors=current_descriptors,
+                                            previous_descriptors=previous_descriptors,
+                                            associations=associations,
+                                            validation_result=validation_result,
+                                            title=f"Feature Associations ({len(associations)} found)"
+                                        )
+                                        
+                                        if fig:
+                                            plt.show()
+                                            print(f"Association visualization displayed with {len(associations)} associations.")
+                                            return
+                                        
+                                    except ImportError as e:
+                                        print(f"Full visualizer not available ({e}), using simple plot...")
+                                    
+                                    # Fallback to simple visualization
+                                    create_simple_association_plot(associations, current_descriptors, previous_descriptors, validation_result)
+                                    
+                                except Exception as e:
+                                    print(f"Error creating visualization: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                            
+                            elif len(localizer.feature_history) >= 2:
+                                # Show just features if we have them
+                                current_features = localizer.feature_history[-1]
+                                previous_features = localizer.feature_history[-2]
+                                create_feature_only_visualization(current_features, previous_features)
                             else:
-                                print("Association visualization method not available.")
+                                print("No usable data found for visualization.")
+                                print("Suggestions:")
+                                print("1. Make sure you've processed at least 2 scans")
+                                print("2. Ensure feature extraction is working")
+                                print("3. Check that association processing is enabled")
+                                
+                                # Show association statistics if available
+                                if hasattr(localizer, 'get_association_statistics'):
+                                    try:
+                                        stats = localizer.get_association_statistics()
+                                        print(f"\nCurrent association statistics:")
+                                        for key, value in stats.items():
+                                            print(f"  {key}: {value}")
+                                    except Exception as e:
+                                        print(f"Could not get association statistics: {e}")
                         else:
-                            print("Feature association is not enabled or not available.")
+                            print("Feature association is not enabled.")
+                            
                     except Exception as e:
-                        print(f"Error creating association visualization: {e}")
+                        print(f"Error in association visualization: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+
+                def create_simple_association_plot(associations, current_descriptors, previous_descriptors, validation_result=None):
+                    """
+                    Create a simple association plot when the full visualizer is not available
+                    """
+                    try:
+                        fig, ax = plt.subplots(figsize=(15, 10))
+                        
+                        # Plot current features
+                        if current_descriptors:
+                            current_x = []
+                            current_y = []
+                            current_types = []
+                            
+                            for desc in current_descriptors:
+                                if desc.base_feature and hasattr(desc.base_feature, 'point_world'):
+                                    current_x.append(desc.base_feature.point_world[0])
+                                    current_y.append(desc.base_feature.point_world[1])
+                                    if hasattr(desc.base_feature, 'feature_type'):
+                                        current_types.append(desc.base_feature.feature_type.value)
+                                    else:
+                                        current_types.append('unknown')
+                            
+                            if current_x:
+                                ax.scatter(current_x, current_y, c='blue', s=50, alpha=0.8, 
+                                        label=f'Current Features ({len(current_x)})', marker='o', edgecolors='black')
+                        
+                        # Plot previous features
+                        if previous_descriptors:
+                            prev_x = []
+                            prev_y = []
+                            
+                            for desc in previous_descriptors:
+                                if desc.base_feature and hasattr(desc.base_feature, 'point_world'):
+                                    prev_x.append(desc.base_feature.point_world[0])
+                                    prev_y.append(desc.base_feature.point_world[1])
+                            
+                            if prev_x:
+                                ax.scatter(prev_x, prev_y, c='red', s=50, alpha=0.6, 
+                                        label=f'Previous Features ({len(prev_x)})', marker='s', edgecolors='black')
+                        
+                        # Plot associations
+                        association_count = 0
+                        if associations and current_descriptors and previous_descriptors:
+                            for i, assoc in enumerate(associations):
+                                try:
+                                    if (assoc.feature_idx1 < len(current_descriptors) and 
+                                        assoc.feature_idx2 < len(previous_descriptors)):
+                                        
+                                        curr_desc = current_descriptors[assoc.feature_idx1]
+                                        prev_desc = previous_descriptors[assoc.feature_idx2]
+                                        
+                                        if (curr_desc.base_feature and prev_desc.base_feature and
+                                            hasattr(curr_desc.base_feature, 'point_world') and 
+                                            hasattr(prev_desc.base_feature, 'point_world')):
+                                            
+                                            x1, y1 = curr_desc.base_feature.point_world[0], curr_desc.base_feature.point_world[1]
+                                            x2, y2 = prev_desc.base_feature.point_world[0], prev_desc.base_feature.point_world[1]
+                                            
+                                            # Color based on association quality
+                                            if hasattr(assoc, 'score'):
+                                                if assoc.score > 0.7:
+                                                    color = 'green'
+                                                elif assoc.score > 0.5:
+                                                    color = 'orange'
+                                                else:
+                                                    color = 'red'
+                                                alpha = min(1.0, assoc.score + 0.3)
+                                            else:
+                                                color = 'gray'
+                                                alpha = 0.5
+                                            
+                                            ax.plot([x1, x2], [y1, y2], color=color, alpha=alpha, linewidth=2)
+                                            association_count += 1
+                                            
+                                except (IndexError, AttributeError) as e:
+                                    continue
+                        
+                        # Add validation info if available
+                        title = f'Feature Associations ({association_count} associations drawn)'
+                        if validation_result:
+                            status = "VALID" if validation_result.is_valid else "INVALID"
+                            confidence = validation_result.confidence if hasattr(validation_result, 'confidence') else 0
+                            title += f' - Validation: {status} (conf: {confidence:.2f})'
+                        
+                        ax.set_aspect('equal')
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlabel('X (meters)')
+                        ax.set_ylabel('Y (meters)')
+                        ax.set_title(title)
+                        ax.legend()
+                        
+                        # Add color legend for association quality
+                        from matplotlib.lines import Line2D
+                        legend_elements = [
+                            Line2D([0], [0], color='green', lw=2, label='High Quality (>0.7)'),
+                            Line2D([0], [0], color='orange', lw=2, label='Medium Quality (0.5-0.7)'),
+                            Line2D([0], [0], color='red', lw=2, label='Low Quality (<0.5)')
+                        ]
+                        ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.15, 1))
+                        
+                        plt.tight_layout()
+                        plt.show()
+                        print(f"Association plot created with {association_count} associations displayed.")
+                        
+                    except Exception as e:
+                        print(f"Failed to create association plot: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+
+                def create_feature_only_visualization(current_features, previous_features):
+                    """
+                    Create a visualization showing only features when association data is not available
+                    """
+                    try:
+                        fig, ax = plt.subplots(figsize=(12, 10))
+                        
+                        # Plot current features
+                        if current_features and hasattr(current_features, 'features'):
+                            current_x = []
+                            current_y = []
+                            current_types = []
+                            
+                            for f in current_features.features:
+                                if hasattr(f, 'point_world'):
+                                    current_x.append(f.point_world[0])
+                                    current_y.append(f.point_world[1])
+                                    if hasattr(f, 'feature_type'):
+                                        current_types.append(f.feature_type.value)
+                                    else:
+                                        current_types.append('unknown')
+                            
+                            if current_x:
+                                ax.scatter(current_x, current_y, c='blue', s=40, alpha=0.8, 
+                                        label=f'Current Features ({len(current_x)})', marker='o')
+                        
+                        # Plot previous features
+                        if previous_features and hasattr(previous_features, 'features'):
+                            prev_x = []
+                            prev_y = []
+                            
+                            for f in previous_features.features:
+                                if hasattr(f, 'point_world'):
+                                    prev_x.append(f.point_world[0])
+                                    prev_y.append(f.point_world[1])
+                            
+                            if prev_x:
+                                ax.scatter(prev_x, prev_y, c='red', s=40, alpha=0.6, 
+                                        label=f'Previous Features ({len(prev_x)})', marker='s')
+                        
+                        ax.set_aspect('equal')
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlabel('X (meters)')
+                        ax.set_ylabel('Y (meters)')
+                        ax.set_title('Features Only (No Association Data Available)')
+                        ax.legend()
+                        
+                        plt.tight_layout()
+                        plt.show()
+                        print("Feature-only visualization created.")
+                        
+                    except Exception as e:
+                        print(f"Failed to create feature-only visualization: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+
+                # Debug function to inspect association engine
+                def debug_association_engine(localizer):
+                    """
+                    Debug the association engine to see what data it contains
+                    """
+                    print("\n=== DEBUGGING ASSOCIATION ENGINE ===")
+                    
+                    if hasattr(localizer, 'association_engine') and localizer.association_engine:
+                        engine = localizer.association_engine
+                        print(f"Association engine type: {type(engine)}")
+                        
+                        # Check for data storage attributes
+                        data_attrs = [
+                            'last_associations', 'recent_associations', 'association_history',
+                            'last_current_descriptors', 'last_previous_descriptors',
+                            'current_descriptors', 'previous_descriptors'
+                        ]
+                        
+                        for attr in data_attrs:
+                            if hasattr(engine, attr):
+                                obj = getattr(engine, attr)
+                                if obj is not None:
+                                    if isinstance(obj, list):
+                                        print(f"  ✓ {attr}: List with {len(obj)} items")
+                                    else:
+                                        print(f"  ✓ {attr}: {type(obj)}")
+                                else:
+                                    print(f"  ○ {attr}: None")
+                            else:
+                                print(f"  ✗ {attr}: Not found")
+                        
+                        # Check statistics
+                        if hasattr(engine, 'get_association_statistics'):
+                            try:
+                                stats = engine.get_association_statistics()
+                                print(f"  Statistics: {stats}")
+                            except Exception as e:
+                                print(f"  Statistics error: {e}")
+                    
+                    print("=" * 40)
+
+
+                # Usage: Add this line to your callback for debugging
+                # debug_association_engine(localizer)
                 
                 def show_association_stats(event):
                     try:
@@ -905,8 +1257,8 @@ def main():
     # Add arguments
     parser.add_argument('--file', type=str, default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to the LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=100,
-                       help='Maximum number of entries to read from the file')
+    parser.add_argument('--max_entries', type=int, default=150,
+                       help='Maximum number of entries to rea0d from the file')
     parser.add_argument('--grid', action='store_true', default=True,
                        help='Enable occupancy grid mapping')
     parser.add_argument('--resolution', type=float, default=0.05,

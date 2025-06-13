@@ -1,6 +1,6 @@
-from __future__ import annotations
 import numpy as np
 import math
+import time
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -8,7 +8,7 @@ from enum import Enum
 # Import existing components
 try:
     from feature_extractor import FeatureSet, LiDARFeature, FeatureType
-    from pose_estimate import PoseEstimate
+    from ScanMatcher import PoseEstimate
     from feature_association import FeatureDescriptor, AssociationScore, FeatureAssociationEngine
     from association_validator import ValidationResult, AssociationValidator
     DEPENDENCIES_AVAILABLE = True
@@ -131,10 +131,29 @@ class EnvironmentClassifier:
         else:
             classifications = {'unknown': 1.0}
         
-        # Store classification
+        # Store classification with smoothing
         self.environment_history.append(classifications)
         if len(self.environment_history) > 10:  # Keep recent history
             self.environment_history.pop(0)
+        
+        # FIXED: Smooth environment classification to prevent rapid changes
+        if len(self.environment_history) > 1:
+            # Use weighted average of recent classifications
+            smoothed_classifications = {}
+            for env_type in classifications.keys():
+                weights = [0.4, 0.3, 0.2, 0.1]  # Recent frames get higher weight
+                weighted_sum = 0.0
+                weight_sum = 0.0
+                for i, weight in enumerate(weights):
+                    if i < len(self.environment_history):
+                        hist_idx = -(i+1)  # Go backwards in history
+                        weighted_sum += self.environment_history[hist_idx].get(env_type, 0.0) * weight
+                        weight_sum += weight
+                if weight_sum > 0:
+                    smoothed_classifications[env_type] = weighted_sum / weight_sum
+                else:
+                    smoothed_classifications[env_type] = classifications[env_type]
+            classifications = smoothed_classifications
         
         # Determine current dominant classification
         self.current_classification = max(classifications.items(), key=lambda x: x[1])[0]
@@ -149,6 +168,7 @@ class AdaptiveWeightCalculator:
     
     def __init__(self):
         self.weight_history = []
+        self.last_weights = {'feature_weight': 0.5, 'icp_weight': 0.5}  # FIXED: Initialize with defaults
         
     def calculate_weights(self, feature_confidence: float, 
                          icp_confidence: float,
@@ -166,19 +186,23 @@ class AdaptiveWeightCalculator:
         Returns:
             Dictionary with weights and metadata
         """
+        # FIXED: Clamp confidence values to prevent extreme weights
+        feature_confidence = max(0.1, min(0.9, feature_confidence))
+        icp_confidence = max(0.1, min(0.9, icp_confidence))
+        
         # Base weights from confidence
         base_feature_weight = feature_confidence
         base_icp_weight = icp_confidence
         
-        # Environment-based adjustments
+        # Environment-based adjustments (FIXED: More conservative adjustments)
         env_adjustments = self._get_environment_adjustments(environment_classification)
         
-        # Validation-based adjustments
+        # Validation-based adjustments (FIXED: More conservative)
         validation_adjustment = 1.0
         if validation_result and validation_result.is_valid:
-            validation_adjustment = 1.0 + 0.3 * validation_result.confidence  # Up to 30% boost
+            validation_adjustment = 1.0 + 0.2 * validation_result.confidence  # Reduced from 0.3 to 0.2
         elif validation_result and not validation_result.is_valid:
-            validation_adjustment = 0.5  # Reduce feature weight if validation failed
+            validation_adjustment = 0.7  # Increased from 0.5 to 0.7
         
         # Apply adjustments
         adjusted_feature_weight = base_feature_weight * env_adjustments['feature_factor'] * validation_adjustment
@@ -195,9 +219,15 @@ class AdaptiveWeightCalculator:
             feature_weight = 0.5
             icp_weight = 0.5
         
-        # Safety bounds
-        feature_weight = max(0.1, min(0.9, feature_weight))  # Keep between 10% and 90%
+        # FIXED: Apply stricter safety bounds to prevent extreme weights
+        feature_weight = max(0.2, min(0.8, feature_weight))  # Keep between 20% and 80%
         icp_weight = 1.0 - feature_weight
+        
+        # FIXED: Smooth weight transitions to prevent jumping
+        if self.weight_history:
+            smoothing_factor = 0.7  # How much to keep from previous weight
+            feature_weight = smoothing_factor * self.last_weights['feature_weight'] + (1 - smoothing_factor) * feature_weight
+            icp_weight = 1.0 - feature_weight
         
         weights = {
             'feature_weight': feature_weight,
@@ -209,8 +239,9 @@ class AdaptiveWeightCalculator:
             'reasoning': self._get_weight_reasoning(feature_weight, environment_classification)
         }
         
-        # Store for analysis
+        # Store for analysis and smoothing
         self.weight_history.append(weights)
+        self.last_weights = {'feature_weight': feature_weight, 'icp_weight': icp_weight}
         if len(self.weight_history) > 20:
             self.weight_history.pop(0)
         
@@ -226,44 +257,44 @@ class AdaptiveWeightCalculator:
         Returns:
             Dictionary with adjustment factors
         """
-        # Default factors
+        # FIXED: More conservative adjustment factors
         feature_factor = 1.0
         icp_factor = 1.0
         
-        # Structured environments favor features
+        # Structured environments favor features (reduced from 0.5 to 0.3)
         structured_score = environment_classification.get('structured', 0.0)
-        feature_factor += structured_score * 0.5  # Up to 50% boost for features
+        feature_factor += structured_score * 0.3
         
-        # Feature-rich environments favor features
+        # Feature-rich environments favor features (reduced from 0.4 to 0.25)
         feature_rich_score = environment_classification.get('feature_rich', 0.0)
-        feature_factor += feature_rich_score * 0.4  # Up to 40% boost
+        feature_factor += feature_rich_score * 0.25
         
-        # Sparse environments favor ICP (more robust to few features)
+        # Sparse environments favor ICP (reduced from 0.6 to 0.4)
         sparse_score = environment_classification.get('sparse', 0.0)
-        icp_factor += sparse_score * 0.6  # Up to 60% boost for ICP
-        feature_factor *= (1.0 - sparse_score * 0.3)  # Reduce feature weight
+        icp_factor += sparse_score * 0.4
+        feature_factor *= (1.0 - sparse_score * 0.2)  # Reduced from 0.3 to 0.2
         
-        # Corridor environments need careful balance
+        # Corridor environments need careful balance (reduced from 0.3 to 0.2)
         corridor_score = environment_classification.get('corridor', 0.0)
-        icp_factor += corridor_score * 0.3  # Slight ICP preference
+        icp_factor += corridor_score * 0.2
         
-        # Planar environments favor ICP (fewer distinctive features)
+        # Planar environments favor ICP (reduced from 0.4 to 0.3)
         planar_score = environment_classification.get('planar', 0.0)
-        icp_factor += planar_score * 0.4
-        feature_factor *= (1.0 - planar_score * 0.2)
+        icp_factor += planar_score * 0.3
+        feature_factor *= (1.0 - planar_score * 0.15)  # Reduced from 0.2 to 0.15
         
-        # Dynamic environments favor features (more robust to changing map)
+        # Dynamic environments favor features (reduced from 0.3 to 0.2)
         dynamic_score = environment_classification.get('dynamic', 0.0)
-        feature_factor += dynamic_score * 0.3
+        feature_factor += dynamic_score * 0.2
         
         return {
             'feature_factor': feature_factor,
             'icp_factor': icp_factor,
-            'structured_bonus': structured_score * 0.5,
-            'sparse_penalty': sparse_score * 0.3,
-            'corridor_adjustment': corridor_score * 0.3,
-            'planar_penalty': planar_score * 0.2,
-            'dynamic_bonus': dynamic_score * 0.3
+            'structured_bonus': structured_score * 0.3,
+            'sparse_penalty': sparse_score * 0.2,
+            'corridor_adjustment': corridor_score * 0.2,
+            'planar_penalty': planar_score * 0.15,
+            'dynamic_bonus': dynamic_score * 0.2
         }
     
     def _get_weight_reasoning(self, feature_weight: float, 
@@ -281,9 +312,9 @@ class AdaptiveWeightCalculator:
         dominant_env = max(environment_classification.items(), key=lambda x: x[1])
         env_name, env_score = dominant_env
         
-        if feature_weight > 0.7:
+        if feature_weight > 0.6:
             return f"Feature-dominant ({feature_weight:.2f}) - {env_name} environment ({env_score:.2f}) favors features"
-        elif feature_weight < 0.3:
+        elif feature_weight < 0.4:
             return f"ICP-dominant ({1-feature_weight:.2f}) - {env_name} environment ({env_score:.2f}) favors dense matching"
         else:
             return f"Balanced ({feature_weight:.2f}/{1-feature_weight:.2f}) - {env_name} environment ({env_score:.2f})"
@@ -316,6 +347,11 @@ class HybridPoseEstimator:
         self.environment_classifier = EnvironmentClassifier() if enable_environment_classification else None
         self.weight_calculator = AdaptiveWeightCalculator() if enable_adaptive_weighting else None
         
+        # FIXED: Add pose validation parameters
+        self.max_position_jump = 1.0  # meters
+        self.max_angle_jump = 0.8    # radians
+        self.validation_enabled = True
+        
         # Statistics
         self.estimation_stats = {
             'total_estimations': 0,
@@ -323,6 +359,7 @@ class HybridPoseEstimator:
             'icp_dominant': 0,
             'balanced': 0,
             'fallback_to_odometry': 0,
+            'rejected_poses': 0,  # FIXED: Track rejected poses
             'average_confidence': 0.0,
             'environment_distribution': {}
         }
@@ -370,6 +407,19 @@ class HybridPoseEstimator:
         has_icp_pose = icp_pose is not None and icp_pose.pose is not None
         has_odometry_pose = odometry_pose is not None
         
+        # FIXED: Validate poses before using them
+        if has_feature_pose and not self._is_pose_valid(feature_pose.pose):
+            if self.debug_level > 0:
+                print("[HybridPoseEstimator] Feature pose rejected - invalid jump")
+            has_feature_pose = False
+            self.estimation_stats['rejected_poses'] += 1
+        
+        if has_icp_pose and not self._is_pose_valid(icp_pose.pose):
+            if self.debug_level > 0:
+                print("[HybridPoseEstimator] ICP pose rejected - invalid jump")
+            has_icp_pose = False
+            self.estimation_stats['rejected_poses'] += 1
+        
         # Environment classification
         environment_classification = {'unknown': 1.0}
         if self.enable_environment_classification and current_features:
@@ -396,45 +446,33 @@ class HybridPoseEstimator:
                 if self.pose_history:
                     last_pose = self.pose_history[-1]
                     result.pose = PoseEstimate(last_pose.x, last_pose.y, last_pose.theta)
-                    result.confidence = 0.2  # Very low confidence
+                    result.confidence = 0.2
                     result.source = PoseSource.RECOVERY
-                    result.fallback_reason = "No poses available, using previous"
+                    result.fallback_reason = "Using previous pose"
                 else:
+                    # Last resort
                     result.pose = PoseEstimate(0, 0, 0)
                     result.confidence = 0.1
                     result.source = PoseSource.RECOVERY
-                    result.fallback_reason = "No poses or history available"
+                    result.fallback_reason = "No poses available"
         
         # Case 2: Only feature pose available
         elif has_feature_pose and not has_icp_pose:
             result = self._copy_pose_with_confidence(feature_pose)
             result.source = PoseSource.FEATURE_BASED
-            
-            # Apply environment-based confidence adjustment
-            if self.enable_environment_classification:
-                env_factor = self._get_single_pose_environment_factor(environment_classification, 'feature')
-                result.confidence *= env_factor
+            self.estimation_stats['feature_dominant'] += 1
         
         # Case 3: Only ICP pose available
-        elif not has_feature_pose and has_icp_pose:
+        elif has_icp_pose and not has_feature_pose:
             result = self._copy_pose_with_confidence(icp_pose)
             result.source = PoseSource.ICP_BASED
-            
-            # Apply environment-based confidence adjustment
-            if self.enable_environment_classification:
-                env_factor = self._get_single_pose_environment_factor(environment_classification, 'icp')
-                result.confidence *= env_factor
+            self.estimation_stats['icp_dominant'] += 1
         
-        # Case 4: Both poses available - hybrid estimation
+        # Case 4: Both poses available - combine intelligently
         else:
             result = self._combine_poses(feature_pose, icp_pose, environment_classification, validation_result)
-        
-        # Post-processing
-        result = self._apply_temporal_smoothing(result)
-        result = self._calculate_uncertainty_estimates(result, feature_pose, icp_pose)
-        
-        # Update statistics
-        if result.source == PoseSource.HYBRID:
+            
+            # Update statistics based on final weights
             if hasattr(result, 'feature_weight'):
                 if result.feature_weight > 0.6:
                     self.estimation_stats['feature_dominant'] += 1
@@ -443,14 +481,35 @@ class HybridPoseEstimator:
                 else:
                     self.estimation_stats['balanced'] += 1
         
-        # Update running average confidence
-        total = self.estimation_stats['total_estimations']
-        self.estimation_stats['average_confidence'] = (
-            (self.estimation_stats['average_confidence'] * (total - 1) + result.confidence) / total
-        )
+        # FIXED: Final validation of the result pose
+        if not self._is_pose_valid(result.pose):
+            if self.debug_level > 0:
+                print("[HybridPoseEstimator] Final result rejected - using fallback")
+            
+            # Use the most confident individual pose instead
+            if has_feature_pose and has_icp_pose:
+                if feature_pose.confidence >= icp_pose.confidence:
+                    result = self._copy_pose_with_confidence(feature_pose)
+                    result.source = PoseSource.FEATURE_BASED
+                else:
+                    result = self._copy_pose_with_confidence(icp_pose)
+                    result.source = PoseSource.ICP_BASED
+                result.fallback_reason = "Hybrid result rejected"
+            elif has_feature_pose:
+                result = self._copy_pose_with_confidence(feature_pose)
+                result.source = PoseSource.FEATURE_BASED
+            elif has_icp_pose:
+                result = self._copy_pose_with_confidence(icp_pose)
+                result.source = PoseSource.ICP_BASED
+            elif has_odometry_pose:
+                result.pose = PoseEstimate(odometry_pose.x, odometry_pose.y, odometry_pose.theta)
+                result.confidence = 0.3
+                result.source = PoseSource.ODOMETRY
+            
+            self.estimation_stats['rejected_poses'] += 1
         
-        # Store in history
-        if result.pose:
+        # Update pose history
+        if result.pose is not None:
             self.pose_history.append(result.pose)
             self.confidence_history.append(result.confidence)
             
@@ -466,6 +525,51 @@ class HybridPoseEstimator:
             self._log_estimation_result(result, environment_classification, has_feature_pose, has_icp_pose)
         
         return result
+    
+    def _is_pose_valid(self, pose: PoseEstimate) -> bool:
+        """
+        FIXED: Validate if a pose is reasonable
+        
+        Args:
+            pose: Pose to validate
+            
+        Returns:
+            True if pose is valid
+        """
+        if not self.validation_enabled or not pose:
+            return True
+        
+        # Check for NaN or infinite values
+        if not (math.isfinite(pose.x) and math.isfinite(pose.y) and math.isfinite(pose.theta)):
+            return False
+        
+        # If no history, accept the pose
+        if not self.pose_history:
+            return True
+        
+        # Check against most recent pose
+        last_pose = self.pose_history[-1]
+        
+        # Calculate position change
+        dx = pose.x - last_pose.x
+        dy = pose.y - last_pose.y
+        distance_change = math.sqrt(dx*dx + dy*dy)
+        
+        # Calculate angle change
+        angle_change = abs(self._normalize_angle(pose.theta - last_pose.theta))
+        
+        # Check limits
+        if distance_change > self.max_position_jump:
+            return False
+        
+        if angle_change > self.max_angle_jump:
+            return False
+        
+        return True
+    
+    def _normalize_angle(self, angle: float) -> float:
+        """Normalize angle to [-π, π]"""
+        return (angle + math.pi) % (2 * math.pi) - math.pi
     
     def _copy_pose_with_confidence(self, source_pose: PoseEstimateWithConfidence) -> PoseEstimateWithConfidence:
         """
@@ -530,16 +634,23 @@ class HybridPoseEstimator:
         combined_x = feature_weight * feature_pose.pose.x + icp_weight * icp_pose.pose.x
         combined_y = feature_weight * feature_pose.pose.y + icp_weight * icp_pose.pose.y
         
-        # Handle angle combination (circular mean)
+        # FIXED: Handle angle combination more robustly
         feature_angle = feature_pose.pose.theta
         icp_angle = icp_pose.pose.theta
         
-        # Convert to unit vectors and combine
-        feature_vec = np.array([math.cos(feature_angle), math.sin(feature_angle)]) * feature_weight
-        icp_vec = np.array([math.cos(icp_angle), math.sin(icp_angle)]) * icp_weight
+        # Calculate angle difference
+        angle_diff = self._normalize_angle(icp_angle - feature_angle)
         
-        combined_vec = feature_vec + icp_vec
-        combined_angle = math.atan2(combined_vec[1], combined_vec[0])
+        # If angles are too different (> 90 degrees), use the more confident one
+        if abs(angle_diff) > math.pi / 2:
+            if feature_weight > icp_weight:
+                combined_angle = feature_angle
+            else:
+                combined_angle = icp_angle
+        else:
+            # Safe to interpolate
+            combined_angle = feature_angle + angle_diff * icp_weight
+            combined_angle = self._normalize_angle(combined_angle)
         
         # Create result
         result = PoseEstimateWithConfidence()
@@ -569,117 +680,46 @@ class HybridPoseEstimator:
     def _get_single_pose_environment_factor(self, environment_classification: Dict[str, float], 
                                           pose_type: str) -> float:
         """
-        Get environment adjustment factor for single pose type
+        Get environment factor for a single pose type
         
         Args:
             environment_classification: Environment classification
-            pose_type: 'feature' or 'icp'
+            pose_type: "feature" or "icp"
             
         Returns:
-            Adjustment factor for confidence
+            Environment adjustment factor
         """
         factor = 1.0
         
-        if pose_type == 'feature':
-            # Features work better in structured environments
+        if pose_type == "feature":
             factor += environment_classification.get('structured', 0.0) * 0.3
-            factor += environment_classification.get('feature_rich', 0.0) * 0.2
-            factor -= environment_classification.get('sparse', 0.0) * 0.3
-            factor -= environment_classification.get('planar', 0.0) * 0.2
+            factor += environment_classification.get('feature_rich', 0.0) * 0.25
+            factor *= (1.0 - environment_classification.get('sparse', 0.0) * 0.2)
+            factor *= (1.0 - environment_classification.get('planar', 0.0) * 0.15)
+            factor += environment_classification.get('dynamic', 0.0) * 0.2
         else:  # icp
-            # ICP works better in dense environments
-            factor += environment_classification.get('sparse', 0.0) * 0.2
-            factor += environment_classification.get('planar', 0.0) * 0.2
-            factor -= environment_classification.get('dynamic', 0.0) * 0.2
+            factor += environment_classification.get('sparse', 0.0) * 0.4
+            factor += environment_classification.get('corridor', 0.0) * 0.2
+            factor += environment_classification.get('planar', 0.0) * 0.3
         
-        return max(0.5, min(1.5, factor))  # Keep within reasonable bounds
-    
-    def _apply_temporal_smoothing(self, current_estimate: PoseEstimateWithConfidence) -> PoseEstimateWithConfidence:
-        """
-        Apply temporal smoothing to reduce jitter
-        
-        Args:
-            current_estimate: Current pose estimate
-            
-        Returns:
-            Smoothed pose estimate
-        """
-        if not self.pose_history or current_estimate.confidence > 0.8:
-            return current_estimate  # No smoothing for high-confidence estimates
-        
-        # Calculate smoothing factor based on confidence
-        smoothing_factor = 0.1 * (1.0 - current_estimate.confidence)  # More smoothing for low confidence
-        
-        if smoothing_factor > 0 and self.pose_history:
-            last_pose = self.pose_history[-1]
-            
-            # Smooth position
-            current_estimate.pose.x = (1 - smoothing_factor) * current_estimate.pose.x + smoothing_factor * last_pose.x
-            current_estimate.pose.y = (1 - smoothing_factor) * current_estimate.pose.y + smoothing_factor * last_pose.y
-            
-            # Smooth orientation (handle wraparound)
-            angle_diff = current_estimate.pose.theta - last_pose.theta
-            angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi  # Normalize
-            smoothed_angle_diff = (1 - smoothing_factor) * angle_diff
-            current_estimate.pose.theta = last_pose.theta + smoothed_angle_diff
-        
-        return current_estimate
-    
-    def _calculate_uncertainty_estimates(self, result: PoseEstimateWithConfidence,
-                                       feature_pose: Optional[PoseEstimateWithConfidence],
-                                       icp_pose: Optional[PoseEstimateWithConfidence]) -> PoseEstimateWithConfidence:
-        """
-        Calculate uncertainty estimates for the hybrid pose
-        
-        Args:
-            result: Current result
-            feature_pose: Feature pose (if available)
-            icp_pose: ICP pose (if available)
-            
-        Returns:
-            Result with uncertainty estimates
-        """
-        # Base uncertainty on confidence
-        base_position_uncertainty = 0.5 * (1.0 - result.confidence)  # meters
-        base_orientation_uncertainty = 0.2 * (1.0 - result.confidence)  # radians
-        
-        # If we have both poses, estimate uncertainty from their disagreement
-        if feature_pose and icp_pose and feature_pose.pose and icp_pose.pose:
-            position_disagreement = math.sqrt(
-                (feature_pose.pose.x - icp_pose.pose.x)**2 +
-                (feature_pose.pose.y - icp_pose.pose.y)**2
-            )
-            
-            angle_disagreement = abs(feature_pose.pose.theta - icp_pose.pose.theta)
-            angle_disagreement = min(angle_disagreement, 2*math.pi - angle_disagreement)
-            
-            # Uncertainty increases with disagreement
-            result.position_uncertainty = max(base_position_uncertainty, position_disagreement * 0.5)
-            result.orientation_uncertainty = max(base_orientation_uncertainty, angle_disagreement * 0.5)
-        else:
-            result.position_uncertainty = base_position_uncertainty
-            result.orientation_uncertainty = base_orientation_uncertainty
-        
-        return result
+        return max(0.1, min(2.0, factor))  # Clamp factor
     
     def _log_estimation_result(self, result: PoseEstimateWithConfidence,
                              environment_classification: Dict[str, float],
                              has_feature_pose: bool, has_icp_pose: bool):
         """
-        Log detailed information about the estimation result
+        Log estimation result for debugging
         
         Args:
-            result: Estimation result
+            result: Final pose estimate
             environment_classification: Environment classification
             has_feature_pose: Whether feature pose was available
             has_icp_pose: Whether ICP pose was available
         """
         dominant_env = max(environment_classification.items(), key=lambda x: x[1])
         
-        print(f"[HybridPoseEstimator] Estimation result:")
-        print(f"  Source: {result.source.value}")
-        print(f"  Confidence: {result.confidence:.3f}")
-        print(f"  Pose: x={result.pose.x:.3f}, y={result.pose.y:.3f}, θ={result.pose.theta:.3f}")
+        print(f"[HybridPoseEstimator] Result: x={result.pose.x:.3f}, y={result.pose.y:.3f}, "
+              f"θ={result.pose.theta:.3f}, conf={result.confidence:.3f}, source={result.source.value}")
         print(f"  Environment: {dominant_env[0]} ({dominant_env[1]:.3f})")
         print(f"  Available: Feature={has_feature_pose}, ICP={has_icp_pose}")
         
@@ -705,6 +745,7 @@ class HybridPoseEstimator:
             stats['icp_dominant_pct'] = stats['icp_dominant'] / total * 100
             stats['balanced_pct'] = stats['balanced'] / total * 100
             stats['fallback_pct'] = stats['fallback_to_odometry'] / total * 100
+            stats['rejected_pct'] = stats['rejected_poses'] / total * 100  # FIXED: Added rejection rate
         
         # Add current configuration
         stats['adaptive_weighting_enabled'] = self.enable_adaptive_weighting
@@ -726,6 +767,7 @@ class HybridPoseEstimator:
             'icp_dominant': 0,
             'balanced': 0,
             'fallback_to_odometry': 0,
+            'rejected_poses': 0,  # FIXED: Reset rejection count
             'average_confidence': 0.0,
             'environment_distribution': {}
         }
@@ -735,6 +777,7 @@ class HybridPoseEstimator:
         
         if self.weight_calculator:
             self.weight_calculator.weight_history = []
+            self.weight_calculator.last_weights = {'feature_weight': 0.5, 'icp_weight': 0.5}  # FIXED: Reset weights
         
         if self.environment_classifier:
             self.environment_classifier.environment_history = []
@@ -747,73 +790,45 @@ class HybridPoseEstimator:
 def create_pose_with_confidence(pose: PoseEstimate, confidence: float, 
                                source: PoseSource = PoseSource.ODOMETRY) -> PoseEstimateWithConfidence:
     """
-    Convenience function to create a PoseEstimateWithConfidence
+    Convert a basic PoseEstimate to PoseEstimateWithConfidence
     
     Args:
-        pose: Base pose estimate
-        confidence: Confidence level
+        pose: Basic pose estimate
+        confidence: Confidence level (0.0 to 1.0)
         source: Pose source
         
     Returns:
-        PoseEstimateWithConfidence object
+        Enhanced pose estimate with confidence
     """
     result = PoseEstimateWithConfidence()
-    result.pose = PoseEstimate(pose.x, pose.y, pose.theta) if pose else None
+    result.pose = pose
     result.confidence = confidence
     result.source = source
+    result.geometric_confidence = confidence
+    result.temporal_confidence = confidence
+    
     return result
 
 
-def estimate_pose_from_associations(associations: List["AssociationScore"],
-                                  current_descriptors: List["FeatureDescriptor"],
-                                  previous_descriptors: List["FeatureDescriptor"],
-                                  validation_result: Optional[ValidationResult] = None) -> PoseEstimateWithConfidence:
+def estimate_pose_from_associations(associations: List[Any], 
+                                  previous_pose: PoseEstimate) -> PoseEstimateWithConfidence:
     """
     Estimate pose from feature associations
     
     Args:
-        associations: Feature associations
-        current_descriptors: Current scan descriptors
-        previous_descriptors: Previous scan descriptors
-        validation_result: Validation result
+        associations: List of feature associations
+        previous_pose: Previous pose estimate
         
     Returns:
-        Feature-based pose estimate with confidence
+        Pose estimate with confidence
     """
-    if not DEPENDENCIES_AVAILABLE:
-        print("Warning: Dependencies not available for pose estimation from associations")
-        return PoseEstimateWithConfidence()
+    # This is a placeholder - implement based on your association structure
+    confidence = min(1.0, len(associations) / 20.0)  # Simple confidence based on association count
     
-    # Use association engine to estimate motion
-    engine = FeatureAssociationEngine()
-    motion_estimate = engine.estimate_motion_from_associations(
-        associations, current_descriptors, previous_descriptors
-    )
-    
-    if motion_estimate is None:
-        return PoseEstimateWithConfidence()
-    
-    # Calculate confidence based on validation and association quality
-    confidence = 0.5  # Base confidence
-    
-    if validation_result and validation_result.is_valid:
-        confidence += 0.3 * validation_result.confidence
-    
-    if associations:
-        avg_association_score = np.mean([a.score for a in associations])
-        confidence += 0.2 * avg_association_score
-    
-    confidence = min(1.0, confidence)
-    
-    # Create result
-    result = create_pose_with_confidence(motion_estimate, confidence, PoseSource.FEATURE_BASED)
+    result = PoseEstimateWithConfidence()
+    result.pose = previous_pose.copy()  # Start with previous pose
+    result.confidence = confidence
+    result.source = PoseSource.FEATURE_BASED
     result.num_features_used = len(associations)
-    result.association_quality = np.mean([a.score for a in associations]) if associations else 0.0
-    result.validation_passed = validation_result.is_valid if validation_result else False
-    
-    if validation_result:
-        result.num_inliers = validation_result.inlier_count
-        result.geometric_confidence = validation_result.geometric_consistency
-        result.temporal_confidence = validation_result.temporal_consistency
     
     return result

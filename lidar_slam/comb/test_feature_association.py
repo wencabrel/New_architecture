@@ -12,12 +12,13 @@ import os
 import sys
 import argparse
 from typing import List, Dict, Tuple, Optional, Any
+from pose_estimate import PoseEstimate
 
 # Import existing components
 try:
     from lidar_utility_functions import parse_lidar_data, convert_scans_to_cartesian, read_lidar_data_from_file
     from feature_extractor import FeatureExtractor, FeatureSet, FeatureType
-    from ScanMatcher import PoseEstimate
+    # from ScanMatcher import PoseEstimate
     
     # Import our new association system
     from feature_association import (
@@ -237,7 +238,7 @@ class FeatureAssociationTestSuite:
                 association_results.append((associations, validation_result))
                 
                 # Create visualization for first few pairs
-                if i < 5:
+                if i < 7:
                     self._visualize_single_association(
                         current_descriptors, previous_descriptors, 
                         associations, validation_result, i+1
@@ -976,9 +977,9 @@ def main():
     parser.add_argument('--file', type=str,
                        default="../dataset/raw_data/laser_data_synchronized_short_u_turn_fast_processed_reduced180.clf",
                        help='Path to LiDAR data file')
-    parser.add_argument('--max_entries', type=int, default=50,
+    parser.add_argument('--max_entries', type=int, default=250,
                        help='Maximum number of scans to process')
-    parser.add_argument('--test_pairs', type=int, default=20,
+    parser.add_argument('--test_pairs', type=int, default=250,
                        help='Number of consecutive pairs to test for association')
     parser.add_argument('--test_poses', type=int, default=15,
                        help='Number of pose estimates to test')

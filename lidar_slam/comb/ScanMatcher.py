@@ -387,6 +387,9 @@ class ImprovedScanMatchingLocalization:
                         scan_timestamp=scan_data['timestamp']
                     )
                     
+                    # NORMALIZE quality scores to fix range issues
+                    self.normalize_quality_scores(feature_set)
+                    
                     # Update feature extraction statistics
                     self.feature_extraction_stats['total_extractions'] += 1
                     self.feature_extraction_stats['total_feature_time'] += feature_set.extraction_time
@@ -792,8 +795,6 @@ class ImprovedScanMatchingLocalization:
                 motion_estimate=motion_estimate,
                 engine=self.association_engine
             )
-            
-
 
             association_time = time.time() * 1000 - association_time_start
             
@@ -1970,6 +1971,24 @@ class ImprovedScanMatchingLocalization:
             stats['quality_acceptable'] = stats['average_quality_score'] >= 0.3
         
         return stats
+    
+
+    def normalize_quality_scores(self, feature_set):
+        """Ensure all quality scores are in 0-1 range"""
+        
+        # Fix overall quality (should be 0-1)
+        if 'overall_quality' in feature_set.quality_metrics:
+            quality = feature_set.quality_metrics['overall_quality']
+            if quality > 1.0:
+                # If it's in 0-100 range, convert to 0-1
+                feature_set.quality_metrics['overall_quality'] = min(1.0, quality / 100.0)
+        
+        # Fix other quality metrics
+        for key, value in feature_set.quality_metrics.items():
+            if isinstance(value, (int, float)) and value > 1.0:
+                # Likely in wrong range, normalize
+                feature_set.quality_metrics[key] = min(1.0, value / 100.0)    
+
     
     def visualize_features_with_trajectory(self, ax=None, show_curvatures=False, feature_types=None):
         """

@@ -1139,7 +1139,7 @@ class FeatureExtractor:
         fig.suptitle('Feature Extraction Summary', fontsize=16)
         
         # Get recent feature sets (last 5 or all if less than 5)
-        recent_features = self.feature_history[-5:]
+        recent_features = self.feature_history[-10:]
         
         # Plot 1: Feature count over time
         ax1 = axes[0, 0]
