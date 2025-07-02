@@ -76,7 +76,7 @@ def convert_scans_to_cartesian(scan_ranges, angle_min, angle_max, pose,
         angles = np.linspace(angle_min, angle_max, num_points)
     
     # Filter out the max range values (11.9 in this case)
-    max_range = 11.9
+    max_range = 9
     valid_indices = [i for i, r in enumerate(scan_ranges) if r < max_range]
     valid_ranges = [scan_ranges[i] for i in valid_indices]
     valid_angles = [angles[i] for i in valid_indices]
@@ -1219,29 +1219,33 @@ def visualize_lidar_data_with_scan_matching(file_path, max_entries=200,
         parsed_data_list,
         flip_x=False,          # Whether to flip the x-axis
         flip_y=False,           # Whether to flip the y-axis
-        reverse_scan=True,     # Whether to reverse the scan direction
+        reverse_scan=False,     # Whether to reverse the scan direction
         flip_theta=False,      # Whether to negate the orientation angle
         show_occupancy_grid=show_occupancy_grid,  # Whether to show occupancy grid
         grid_resolution=grid_resolution,          # Resolution of the grid in meters
         save_grid=save_grid,                      # Whether to save the final grid
         save_format=save_format,                  # Format to save the grid
         save_path=maps_dir,                       # Directory to save the grid
-        use_scan_matching=use_scan_matching       # Whether to use scan matching
+        # use_scan_matching=use_scan_matching       # Whether to use scan matching
     )
 
 
 # Main execution example
 if __name__ == "__main__":
     # File path to read LiDAR data from
-    file_path = "./lidar_slam/dataset/raw_data/raw_data_zjnu20_21_3F_short.clf"
+<<<<<<< HEAD
+    file_path = "./lidar_slam/dataset/raw_data/laser_data_synchronized_data_drift_turn_reduced180.clf"
+=======
+    file_path = "./lidar_slam/dataset/raw_data/raw_data_synchronized_processed_reduced180.clf"
+>>>>>>> b3d78684c85791ae0882bed2bc4a641b1b3762e0
     
     # Run the enhanced visualization with scan matching
     visualize_lidar_data_with_scan_matching(
         file_path, 
-        max_entries=2599,          # Number of entries to process
+        max_entries=3277,          # Number of entries to process
         show_occupancy_grid=True,  # Enable occupancy grid mapping
         grid_resolution=0.05,      # Grid resolution in meters (5cm per cell)
         save_grid=True,            # Save the final occupancy grid map
         save_format='png',         # Save format
-        use_scan_matching=True     # Enable scan matching for improved mapping
+        use_scan_matching=False    # Enable scan matching for improved mapping
     )

@@ -322,7 +322,7 @@ class OccupancyGridVisualizer:
         )
         
         # Also save raw grid data and metadata
-        self.occupancy_grid.save_to_file(base_filename, format='all', include_metadata=True)
+        self.occupancy_grid.save_to_file(base_filename, format='png', include_metadata=True)
         
         print(f"\nOccupancy grid map saved to {base_filename} with current robot path and positions")
     

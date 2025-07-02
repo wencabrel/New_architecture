@@ -28,10 +28,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Enhanced LiDAR SLAM Visualization and Mapping')
     
     parser.add_argument('--file', '-f', type=str, 
-                        default="./dataset/raw_data/raw_data_zjnu20_21_3F_short.clf",
+                        default="./dataset/raw_data/laser_data_synchronized_data_u_turn_processed_reduced180.clf",
                         help='Path to the LiDAR data file')
     
-    parser.add_argument('--max-entries', '-m', type=int, default=3162,
+    parser.add_argument('--max-entries', '-m', type=int, default=500,
                         help='Maximum number of entries to read from the file')
     
     parser.add_argument('--grid', '-g', action='store_true', default=True,
@@ -97,6 +97,28 @@ def parse_arguments():
     parser.add_argument('--min-confidence', type=float, default=0.1,
                        help='Minimum confidence threshold for scan matching')
     
+    # Arguments for enhanced occupancy grid features
+    parser.add_argument('--use-enhanced-grid', action='store_true', default=True,
+                        help='Use enhanced occupancy grid with dynamic expansion and turn handling')
+    
+    parser.add_argument('--no-enhanced-grid', dest='use_enhanced_grid', action='store_false',
+                        help='Disable enhanced occupancy grid features (use legacy grid)')
+    
+    parser.add_argument('--show-dynamic', action='store_true', default=False,
+                        help='Highlight potentially dynamic objects in the grid visualization')
+    
+    parser.add_argument('--enable-turn-handling', action='store_true', default=True,
+                        help='Enable special handling of turns for better mapping')
+    
+    parser.add_argument('--no-turn-handling', dest='enable_turn_handling', action='store_false',
+                        help='Disable special handling of turns')
+    
+    parser.add_argument('--sensor-noise-variance', type=float, default=0.01,
+                        help='Variance parameter for sensor noise model (default: 0.01)')
+    
+    parser.add_argument('--expansion-factor', type=float, default=1.5,
+                        help='Factor by which to expand grid when needed (default: 1.5 = 50% expansion)')
+    
     return parser.parse_args()
 
 def visualize_lidar_slam(args):
@@ -137,7 +159,31 @@ def visualize_lidar_slam(args):
     print(f"  SLAM Mode: {slam_mode.value}")
     print(f"  Pose Estimation Method: {pose_method.value}")
     
-    coordinator = SLAMCoordinator(mode=slam_mode, grid_resolution=args.resolution)
+    # Check if enhanced grid features are enabled
+    if args.use_enhanced_grid:
+        print(f"  Enhanced Grid: ENABLED")
+        print(f"  - Dynamic Expansion: ENABLED (factor: {args.expansion_factor})")
+        print(f"  - Turn Handling: {'ENABLED' if args.enable_turn_handling else 'DISABLED'}")
+        print(f"  - Sensor Noise Variance: {args.sensor_noise_variance}")
+    else:
+        print(f"  Enhanced Grid: DISABLED (using legacy grid)")
+    
+    # Initialize the SLAM coordinator with enhanced grid parameters
+    coordinator = SLAMCoordinator(
+        mode=slam_mode, 
+        grid_resolution=args.resolution,
+        use_enhanced_grid=args.use_enhanced_grid
+    )
+    
+    # Configure the enhanced grid parameters if enabled
+    if args.use_enhanced_grid:
+        coordinator.enhanced_grid_params = {
+            'expansion_factor': args.expansion_factor,
+            'sensor_noise_variance': args.sensor_noise_variance,
+            'turn_detection_threshold': 0.001,  # Adjustable threshold for turn detection
+            'max_angle_of_incidence': 80,       # Maximum angle for reliable measurements
+            'motion_compensation': args.enable_turn_handling  # Enable/disable turn handling
+        }
     
     # Configure scan parameters
     scan_config = {
@@ -187,6 +233,7 @@ def visualize_lidar_slam(args):
     
     # Configure the visualizer
     viz.config = scan_config
+    viz.show_dynamic = args.show_dynamic  # Pass the dynamic object visualization flag
     
     # Start the visualization
     viz.show(
@@ -256,6 +303,32 @@ def plot_slam_results(coordinator, output_dir=None):
         if output_dir:
             plt.savefig(os.path.join(output_dir, "path_comparison.png"), dpi=300)
     
+    # Plot turn rate data if available in the SLAM coordinator
+    if hasattr(coordinator, 'turn_rates') and coordinator.turn_rates:
+        plt.figure(figsize=(10, 6))
+        turn_rates = coordinator.turn_rates
+        timestamps = np.arange(len(turn_rates))
+        
+        # Plot absolute turn rate
+        plt.plot(timestamps, [abs(r) for r in turn_rates], 'b-', linewidth=2, label='Turn Rate')
+        
+        # Plot turn detection threshold
+        if hasattr(coordinator, 'enhanced_grid_params') and 'turn_detection_threshold' in coordinator.enhanced_grid_params:
+            threshold = coordinator.enhanced_grid_params['turn_detection_threshold']
+            plt.axhline(y=threshold, color='r', linestyle='--', 
+                      label=f'Turn Threshold ({threshold:.4f})')
+        
+        # Format the plot
+        plt.title('Robot Turn Rate Over Time')
+        plt.xlabel('Scan Number')
+        plt.ylabel('Turn Rate (rad/update)')
+        plt.grid(True)
+        plt.legend()
+        
+        # Save the plot if output directory is specified
+        if output_dir:
+            plt.savefig(os.path.join(output_dir, "turn_rate_analysis.png"), dpi=300)
+    
     # Show the plots if not saving
     if not output_dir:
         plt.show()
@@ -295,6 +368,27 @@ def main():
                 ]
                 avg_correction = np.mean(correction_distances)
                 print(f"  Average Pose Correction: {avg_correction:.4f} meters")
+        
+        # Print enhanced grid statistics if available
+        if args.use_enhanced_grid and coordinator.occupancy_grid and hasattr(coordinator.occupancy_grid, 'stats'):
+            stats = coordinator.occupancy_grid.stats
+            print(f"\nEnhanced Grid Statistics:")
+            print(f"  Free Cells: {stats['free_cell_count']}")
+            print(f"  Occupied Cells: {stats['occupied_cell_count']}")
+            print(f"  Unknown Cells: {stats['unknown_cell_count']}")
+            print(f"  Total Updates: {stats['updates']}")
+            print(f"  Grid Expansions: {stats['resizes']}")
+            
+            # Calculate grid efficiency (% of cells that are used)
+            total_cells = coordinator.occupancy_grid.grid_width * coordinator.occupancy_grid.grid_height
+            used_cells = stats['free_cell_count'] + stats['occupied_cell_count']
+            efficiency = (used_cells / total_cells) * 100 if total_cells > 0 else 0
+            print(f"  Grid Efficiency: {efficiency:.1f}% ({used_cells}/{total_cells} cells used)")
+            
+            # Show if turn handling was used
+            if hasattr(coordinator.occupancy_grid, 'motion_compensation'):
+                turn_status = "ENABLED" if coordinator.occupancy_grid.motion_compensation else "DISABLED"
+                print(f"  Turn Handling: {turn_status}")
         
         # Plot additional SLAM results if requested
         if args.show_corrections:
